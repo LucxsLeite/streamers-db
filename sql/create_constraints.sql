@@ -130,8 +130,11 @@ ALTER TABLE Plataforma  ADD CONSTRAINT chk_plataforma_users CHECK (qtd_users >= 
 ALTER TABLE PlataformaUsuario ADD CONSTRAINT chk_platusuario_nro CHECK (nro_usuario > 0);
 ALTER TABLE Canal       ADD CONSTRAINT chk_canal_tipo CHECK (tipo IN ('privado', 'publico', 'misto'));
 ALTER TABLE Canal       ADD CONSTRAINT chk_canal_views CHECK (qtd_visualizacoes >= 0);
+ALTER TABLE Canal       ADD CONSTRAINT chk_canal_qtd_videos CHECK (qtd_videos >= 0);
 ALTER TABLE Patrocinio  ADD CONSTRAINT chk_patrocinio_valor CHECK (valor > 0);
-ALTER TABLE NivelCanal  ADD CONSTRAINT chk_nivelcanal_nivel CHECK (nivel > 0);
+-- "Existem cinco níveis": com UNIQUE (id_canal, nivel) este CHECK garante no máximo 5
+-- por canal (o mínimo de 5 é garantido por trigger).
+ALTER TABLE NivelCanal  ADD CONSTRAINT chk_nivelcanal_nivel CHECK (nivel BETWEEN 1 AND 5);
 ALTER TABLE NivelCanal  ADD CONSTRAINT chk_nivelcanal_valor CHECK (valor >= 0);
 ALTER TABLE Video       ADD CONSTRAINT chk_video_simul CHECK (visu_simul >= 0);
 ALTER TABLE Video       ADD CONSTRAINT chk_video_total CHECK (visu_total >= 0);

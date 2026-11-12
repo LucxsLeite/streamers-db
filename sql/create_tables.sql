@@ -77,6 +77,7 @@ CREATE TABLE Canal (
     data DATE NOT NULL DEFAULT CURRENT_DATE,
     descricao TEXT,
     qtd_visualizacoes BIGINT NOT NULL DEFAULT 0,   -- atributo derivado, atualizado por trigger
+    qtd_videos INT NOT NULL DEFAULT 0,             -- atributo derivado, atualizado por trigger
     nick_streamer VARCHAR(50) NOT NULL
 );
 
