@@ -1,344 +1,303 @@
--- =====================================================================
--- PROJETO DE BANCO DE DADOS 2026/2 - UFF - Prof. Marcos Bedo
--- Arquivo 4: chamadas de teste (consultas Q1-Q12 e triggers)
--- Os valores de filtro são escolhidos por subconsultas, para sempre
--- existirem na carga gerada.
--- =====================================================================
+-- ---------------------------------------------------------------------
+-- Blocos de falha usam ROLLBACK para deixar a sessão limpa.
+-- Parte 1: triggers. Parte 2: functions de consulta (somente leitura).
+-- ---------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------
+-- T01: passaporte para dono de canal
+-- ---------------------------------------------------------------------
+-- PASSA: ana_fan tem passaporte
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, nick_streamer)
+VALUES ('CanalT01Ok', 1, 'público', '2020-01-01', 'ana_fan');
+-- FALHA "T01:": pedro_gg não tem passaporte
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, nick_streamer)
+VALUES ('CanalT01Erro', 1, 'público', '2020-01-01', 'pedro_gg');
+
+
+-- ---------------------------------------------------------------------
+-- T02: não apagar o último passaporte de quem tem canal
+-- ---------------------------------------------------------------------
+-- PASSA: ana_fan ganha passaporte de Portugal; remover o do Brasil é permitido
+INSERT INTO StreamerPais (nick_streamer, ddi_pais, nro_passaporte)
+VALUES ('ana_fan', 351, 'PT_REF');
+DELETE FROM StreamerPais WHERE nick_streamer = 'ana_fan' AND ddi_pais = 55;
+-- FALHA "T02:": é o último passaporte de ana_fan, que tem canal
+DELETE FROM StreamerPais WHERE nick_streamer = 'ana_fan' AND ddi_pais = 351;
+
+
+-- ---------------------------------------------------------------------
+-- T03: doação em no máximo um meio de pagamento
+-- ---------------------------------------------------------------------
+-- PASSA: comentário novo, doação e um meio (tudo no mesmo bloco, por causa de T04)
+BEGIN;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 22, 'pedro_gg', 'T03 ok', '2026-03-10 21:00', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'BRL', 10.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 22;
+INSERT INTO CartaoCredito (id_comentario, nro_cartao)
+SELECT c.id_comentario, 'CARD000003'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 22;
+COMMIT;
+-- FALHA "T03:": segundo meio (PayPal) para a mesma doação
+BEGIN;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 23, 'pedro_gg', 'T03 erro', '2026-03-10 21:05', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'BRL', 10.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 23;
+INSERT INTO CartaoCredito (id_comentario, nro_cartao)
+SELECT c.id_comentario, 'CARD000004'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 23;
+INSERT INTO PayPal (id_comentario, IdPayPal)
+SELECT c.id_comentario, 'PP-T03-TESTE'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 23;
+COMMIT;
+ROLLBACK;
+
+
+-- ---------------------------------------------------------------------
+-- T04: toda doação tem exatamente uma forma de pagamento (no COMMIT)
+-- ---------------------------------------------------------------------
+-- FALHA "T04:": doação sem nenhum meio de pagamento
+BEGIN;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 24, 'pedro_gg', 'T04', '2026-03-10 21:10', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'BRL', 10.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 24;
+COMMIT;
+ROLLBACK;
+
+
+-- ---------------------------------------------------------------------
+-- T05: canal com exatamente cinco níveis (no COMMIT)
+-- ---------------------------------------------------------------------
+-- PASSA: canal com cinco níveis no mesmo bloco
+BEGIN;
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, nick_streamer)
+VALUES ('CanalT05Ok', 1, 'público', '2021-01-01', 'ana_fan');
+INSERT INTO NivelCanal (id_canal, nivel, valor, gif)
+SELECT id_canal, n.nivel, n.valor, 'g' || n.nivel || '.gif'
+  FROM Canal c CROSS JOIN (VALUES ('Bronze',3),('Prata',5),('Ouro',10),('Diamante',20),('Lenda',50)) AS n(nivel,valor)
+ WHERE c.nome = 'CanalT05Ok';
+COMMIT;
+
+-- FALHA "T05:": canal com três níveis
+BEGIN;
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, nick_streamer)
+VALUES ('CanalT05Erro', 1, 'público', '2021-01-01', 'ana_fan');
+INSERT INTO NivelCanal (id_canal, nivel, valor, gif)
+SELECT id_canal, n.nivel, n.valor, 'g' || n.nivel || '.gif'
+  FROM Canal c CROSS JOIN (VALUES ('Bronze',3),('Prata',5),('Ouro',10)) AS n(nivel,valor)
+ WHERE c.nome = 'CanalT05Erro';
+COMMIT;
+ROLLBACK;
+
+
+-- ---------------------------------------------------------------------
+-- T06: conversão para USD na gravação
+-- ---------------------------------------------------------------------
+-- PASSA: 100 BRL com fator 0,19 deve gravar valor = 19.00
+BEGIN;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 20, 'pedro_gg', 'T06 ok', '2026-03-10 21:20', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'BRL', 100.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 20;
+INSERT INTO CartaoCredito (id_comentario, nro_cartao)
+SELECT c.id_comentario, 'CARD000002'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 20;
+COMMIT;
+SELECT d.moeda, d.valor_original, d.valor   -- valor deve ser 19.00
+  FROM Doacao d JOIN Comentario c ON c.id_comentario = d.id_comentario
+ WHERE c.seq = 20 AND c.id_video = (SELECT id_video FROM Video WHERE titulo = 'Zerando');
+-- FALHA "moeda sem fator": XYZ não está em Conversao, então o trigger T06
+-- não calcula valor e o NOT NULL recusa a linha (mensagem: valor nulo).
+BEGIN;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 21, 'pedro_gg', 'T06 erro', '2026-03-10 21:25', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'XYZ', 50.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 21;
+COMMIT;
+ROLLBACK;
+
+
+-- ---------------------------------------------------------------------
+-- T07: vídeo não anterior ao início do canal
+-- ---------------------------------------------------------------------
+-- PASSA: vídeo em 2026, canal desde 2020
+INSERT INTO Video (id_canal, titulo, dataH, tema, duracao, visu_simul, visu_total)
+SELECT id_canal, 'Novo T07', '2026-04-01 10:00', 'RPG', INTERVAL '1 hour', 10, 20
+  FROM Canal WHERE nome = 'GamerTV';
+-- FALHA "T07:": vídeo de 2019, antes do início do canal
+INSERT INTO Video (id_canal, titulo, dataH, tema, duracao, visu_simul, visu_total)
+SELECT id_canal, 'Antigo T07', '2019-01-01 10:00', 'RPG', INTERVAL '1 hour', 10, 20
+  FROM Canal WHERE nome = 'GamerTV';
+
+
+-- ---------------------------------------------------------------------
+-- T08: dono do canal não é convidado do próprio vídeo
+-- ---------------------------------------------------------------------
+-- PASSA: convida um streamer com passaporte que não é o dono do canal 'GamerTV'
+INSERT INTO Participa (id_video, nick_streamer)
+SELECT v.id_video, s.nick_streamer
+  FROM Video v
+  JOIN Canal c ON c.id_canal = v.id_canal
+  JOIN StreamerPais s ON s.nick_streamer <> c.nick_streamer
+ WHERE v.titulo = 'Zerando'
+ LIMIT 1;
+-- FALHA "T08:": dono do canal convidado do próprio vídeo
+INSERT INTO Participa (id_video, nick_streamer)
+SELECT v.id_video, c.nick_streamer
+  FROM Video v
+  JOIN Canal c ON c.id_canal = v.id_canal
+ WHERE v.titulo = 'Zerando';
+
+
+-- ---------------------------------------------------------------------
+-- T09: dono do canal não é membro dele
+-- ---------------------------------------------------------------------
+-- PASSA: pedro_gg não é dono do GamerTV
+INSERT INTO Inscricao (id_canal, nick_membro, nivel)
+SELECT id_canal, 'pedro_gg', 'Bronze' FROM Canal WHERE nome = 'GamerTV';
+-- FALHA "T09:": ana_fan é dona do GamerTV
+INSERT INTO Inscricao (id_canal, nick_membro, nivel)
+SELECT id_canal, 'ana_fan', 'Bronze' FROM Canal WHERE nome = 'GamerTV';
+
+
+-- ---------------------------------------------------------------------
+-- T10: comentário não anterior à postagem do vídeo
+-- ---------------------------------------------------------------------
+-- PASSA: comentário após a postagem de 'Zerando' (2026-03-10 19:00)
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 10, 'pedro_gg', 'Teste', '2026-03-10 20:00', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+-- FALHA "T10:": comentário antes da postagem
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 11, 'pedro_gg', 'Teste', '2026-03-10 18:00', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+
+
+-- ---------------------------------------------------------------------
+-- T11: toda empresa tem ao menos um país de origem (no COMMIT)
+-- Usa nro 5000 e 5001: a carga já usa de 1 a 1000.
+-- ---------------------------------------------------------------------
+-- PASSA: empresa com seu país no mesmo bloco
+BEGIN;
+INSERT INTO Empresa (nro, nome, nome_fantasia) VALUES (5000, 'Empresa T11', 'ET11');
+INSERT INTO EmpresaPais (nro_empresa, ddi_pais, id_nacional) VALUES (5000, 55, 'CNPJ-T11');
+COMMIT;
+
+-- FALHA "T11:": empresa sem país de origem
+BEGIN;
+INSERT INTO Empresa (nro, nome, nome_fantasia) VALUES (5001, 'Empresa Sem Pais', 'ESP');
+COMMIT;
+ROLLBACK;
+
+-- FALHA "T11:": apagar o único país da empresa 5000
+BEGIN;
+DELETE FROM EmpresaPais WHERE nro_empresa = 5000;
+COMMIT;
+ROLLBACK;
+
+
+-- #####################################################################
+-- PARTE 2 - CONSULTAS
+-- Atualiza as materializadas (a parte 1 inseriu comentários e doações).
+-- #####################################################################
 
 CALL sp_atualizar_visoes();
 
+-- Q1: streamers com mais vídeos (todas, plataforma 1, plataforma inexistente)
+SELECT * FROM fn_q01_streamers_mais_videos() LIMIT 10;
+SELECT * FROM fn_q01_streamers_mais_videos(1) LIMIT 10;
+SELECT * FROM fn_q01_streamers_mais_videos(999);            -- vazio
 
--- #####################################################################
--- PARTE 1 - CONSULTAS
--- #####################################################################
+-- Q2: vídeos mais comentados (todos e de um canal)
+SELECT * FROM fn_q02_videos_mais_comentados() LIMIT 10;
+SELECT * FROM fn_q02_videos_mais_comentados(
+           (SELECT id_canal FROM Canal WHERE nome = 'GamerTV'));
 
--- ---- Q1: streamers com mais vídeos (sem filtro / filtrando uma plataforma) ----
-SELECT * FROM fn_q1_streamers_mais_videos() LIMIT 10;
-SELECT * FROM fn_q1_streamers_mais_videos(
-         (SELECT nro_plataforma FROM canal GROUP BY nro_plataforma
-           ORDER BY COUNT(*) DESC, nro_plataforma LIMIT 1)) LIMIT 10;
+-- Q3: canais por interações (todos e de um streamer)
+SELECT * FROM fn_q03_canais_mais_interacoes() LIMIT 10;
+SELECT * FROM fn_q03_canais_mais_interacoes('ana_fan');
 
--- ---- Q2: vídeos com mais comentários (sem filtro / filtrando um canal) ----
-SELECT * FROM fn_q2_videos_mais_comentados() LIMIT 10;
-SELECT * FROM fn_q2_videos_mais_comentados(
-         (SELECT id_canal FROM video GROUP BY id_canal
-           ORDER BY COUNT(*) DESC, id_canal LIMIT 1)) LIMIT 10;
+-- Q4: média de doação por canal (todas e plataforma 2)
+SELECT * FROM fn_q04_canais_media_doacao() LIMIT 10;
+SELECT * FROM fn_q04_canais_media_doacao(2) LIMIT 10;
 
--- ---- Q3: canais por total de interações e média por vídeo ----
-SELECT * FROM fn_q3_canais_interacoes() LIMIT 10;
-SELECT * FROM fn_q3_canais_interacoes('user_1');
+-- Q5: patrocínios por empresa (todas e uma empresa)
+SELECT * FROM fn_q05_patrocinios_por_empresa() LIMIT 10;
+SELECT * FROM fn_q05_patrocinios_por_empresa(
+           (SELECT nro_empresa FROM Patrocinio LIMIT 1));
 
--- ---- Q4: canais por valor médio de doação por comentário ----
-SELECT * FROM fn_q4_canais_media_doacao() LIMIT 10;
-SELECT * FROM fn_q4_canais_media_doacao(
-         (SELECT nro_plataforma FROM canal GROUP BY nro_plataforma
-           ORDER BY COUNT(*) DESC, nro_plataforma LIMIT 1)) LIMIT 10;
+-- Q6: membros por usuário (todos e um usuário)
+SELECT * FROM fn_q06_membros_por_usuario() LIMIT 10;
+SELECT * FROM fn_q06_membros_por_usuario('pedro_gg');
 
--- ---- Q5: canais patrocinados e valores pagos por empresa ----
-SELECT * FROM fn_q5_patrocinios_por_empresa() LIMIT 10;
-SELECT * FROM fn_q5_patrocinios_por_empresa(
-         (SELECT id_empresa FROM patrocinio ORDER BY valor DESC, id_empresa LIMIT 1));
+-- Q7: canais com doações (todos e um canal)
+SELECT * FROM fn_q07_canais_com_doacoes() LIMIT 10;
+SELECT * FROM fn_q07_canais_com_doacoes(
+           (SELECT id_canal FROM Canal WHERE nome = 'GamerTV'));
 
--- ---- Q6: quantos canais cada usuário apoia e quanto paga por mês ----
-SELECT * FROM fn_q6_membros_por_usuario() LIMIT 10;
-SELECT * FROM fn_q6_membros_por_usuario('user_1001');
+-- Q8 a Q11: top-k (k = 5)
+SELECT * FROM fn_q08_top_canais_patrocinio(5);
+SELECT * FROM fn_q09_top_canais_membros(5);
+SELECT * FROM fn_q10_top_canais_doacoes(5);
+SELECT * FROM fn_q11_top_canais_faturamento(5);
 
--- ---- Q7: canais que já receberam doações ----
-SELECT * FROM fn_q7_canais_com_doacoes() LIMIT 10;
-SELECT * FROM fn_q7_canais_com_doacoes(
-         (SELECT id_canal FROM mv_canal_doacoes ORDER BY valor_total_usd DESC LIMIT 1));
+-- k inválido (descomente para ver o erro "Q8: k deve ser um inteiro positivo")
+-- SELECT * FROM fn_q08_top_canais_patrocinio(0);
 
--- ---- Q8: top-k patrocínio ----
-SELECT * FROM fn_q8_top_k_patrocinio(5);
-
--- ---- Q9: top-k aportes de membros ----
-SELECT * FROM fn_q9_top_k_membros(5);
-
--- ---- Q10: top-k doações ----
-SELECT * FROM fn_q10_top_k_doacoes(5);
-
--- ---- Q11: top-k faturamento (patrocínio + membros + doações) ----
-SELECT * FROM fn_q11_top_k_faturamento(5);
-
--- ---- Q12 (desafio): top-k plataformas por streamers e canais ----
-SELECT * FROM fn_q12_top_k_plataformas(5);
-SELECT * FROM fn_q12_top_k_plataformas(NULL, 1);        -- só a plataforma 1
-SELECT * FROM fn_q12_top_k_plataformas(p_nro_plataforma => 1);
-
--- ---- k inválido deve falhar (erro esperado) ----
--- SELECT * FROM fn_q8_top_k_patrocinio(0);
+-- Q12: plataformas (top 3, e só a plataforma 1)
+SELECT * FROM fn_q12_top_plataformas(3);
+SELECT * FROM fn_q12_top_plataformas(3, 1);
 
 
--- #####################################################################
--- PARTE 2 - TRIGGERS
--- Cada teste roda dentro de BEGIN ... ROLLBACK (não altera os dados).
--- Os testes de bloqueio imprimem "OK (bloqueado)" quando o trigger barra a
--- operação. As regras verificadas no COMMIT são forçadas com
--- SET CONSTRAINTS ALL IMMEDIATE.
--- #####################################################################
+-- ---------------------------------------------------------------------
+-- Conferências: os dois valores de cada linha devem ser iguais
+-- ---------------------------------------------------------------------
 
--- ---- T1: mover conta entre plataformas ajusta qtd_users das duas ----
-BEGIN;
-SELECT nro_plataforma, qtd_users FROM plataforma WHERE nro_plataforma IN (1, 2) ORDER BY 1;
-UPDATE plataforma_usuario SET nro_plataforma = 2
- WHERE nick_usuario = (SELECT nick_usuario FROM plataforma_usuario WHERE nro_plataforma = 1 LIMIT 1);
-SELECT nro_plataforma, qtd_users FROM plataforma WHERE nro_plataforma IN (1, 2) ORDER BY 1;  -- 1 diminui, 2 aumenta
-ROLLBACK;
+-- Q3: soma das interações dos canais = total de comentários
+SELECT (SELECT SUM(total_interacoes) FROM fn_q03_canais_mais_interacoes()) AS pela_function,
+       (SELECT COUNT(*) FROM Comentario)                                    AS direto;
 
--- ---- T2: inserir vídeo atualiza qtd_videos e qtd_visualizacoes do canal ----
-BEGIN;
-SELECT id_canal, qtd_videos, qtd_visualizacoes FROM canal WHERE id_canal = 1;
-INSERT INTO video (id_canal, titulo, data_hora, tema, duracao, visu_simul, visu_total)
-SELECT 1, 'teste T2', data_inicio::timestamp + INTERVAL '10 days', 'FPS', INTERVAL '1 hour', 10, 1000
-  FROM canal WHERE id_canal = 1;
-SELECT id_canal, qtd_videos, qtd_visualizacoes FROM canal WHERE id_canal = 1;  -- +1 vídeo, +1000 visualizações
-ROLLBACK;
+-- Q10: soma das doações dos canais = soma das doações não recusadas
+SELECT (SELECT SUM(soma_usd) FROM fn_q10_top_canais_doacoes(1000000)) AS pela_function,
+       (SELECT SUM(valor) FROM Doacao WHERE status <> 'recusado')  AS direto;
 
--- ---- T3 (+T12/T15 no commit): canal novo nasce com 5 níveis ----
-BEGIN;
-INSERT INTO canal (nome, nro_plataforma, nick_streamer, tipo, data_inicio, descricao)
-VALUES ('canal_teste_t3', 1, 'user_1', 'publico', DATE '2024-01-01', 'teste');
-SELECT n.nivel, n.nome, n.valor, n.gif
-  FROM nivel_canal n JOIN canal c ON c.id_canal = n.id_canal
- WHERE c.nome = 'canal_teste_t3' ORDER BY n.nivel;                              -- 5 linhas
-SET CONSTRAINTS ALL IMMEDIATE;                                                  -- não deve dar erro
-ROLLBACK;
+-- Q11: o canal que mais fatura, recalculado a partir das tabelas cruas
+WITH t AS (SELECT * FROM fn_q11_top_canais_faturamento(1))
+SELECT t.id_canal,
+       t.total AS pela_function,
+       (SELECT COALESCE(SUM(p.valor), 0) FROM Patrocinio p WHERE p.id_canal = t.id_canal)
+     + (SELECT COALESCE(SUM(n.valor), 0)
+          FROM Inscricao i
+          JOIN NivelCanal n ON n.id_canal = i.id_canal AND n.nivel = i.nivel
+         WHERE i.id_canal = t.id_canal)
+     + (SELECT COALESCE(SUM(d.valor), 0)
+          FROM Doacao d
+          JOIN Comentario co ON co.id_comentario = d.id_comentario
+          JOIN Video v       ON v.id_video       = co.id_video
+         WHERE v.id_canal = t.id_canal AND d.status <> 'recusado') AS recalculado
+  FROM t;
 
--- ---- T4: vídeo anterior ao início do canal ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO video (id_canal, titulo, data_hora, tema, duracao, visu_simul, visu_total)
-        SELECT id_canal, 'teste T4', data_inicio::timestamp - INTERVAL '1 day', 'FPS', INTERVAL '10 minutes', 1, 10
-          FROM canal WHERE id_canal = 1;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T4  - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T14: mover o início do canal para depois de seus vídeos ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        UPDATE canal SET data_inicio = DATE '2099-01-01'
-         WHERE id_canal = (SELECT id_canal FROM video LIMIT 1);
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T14 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T5: dono do canal como convidado do próprio vídeo ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO participa (id_video, nick_streamer)
-        SELECT v.id_video, c.nick_streamer
-          FROM video v JOIN canal c ON c.id_canal = v.id_canal
-         LIMIT 1;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T5  - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T6: dono do canal como membro dele ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO inscricao (nick_membro, id_canal, nivel)
-        SELECT nick_streamer, id_canal, 1 FROM canal LIMIT 1;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T6  - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T7: numeração do comentário (max+1 no vídeo) ----
-BEGIN;
-SELECT id_video, MAX(seq) AS ultimo_seq FROM comentario WHERE id_video = 1 GROUP BY id_video;
-INSERT INTO comentario (id_video, nick_usuario, texto, data_hora, coment_on)
-SELECT id_video, 'user_1', 'teste de numeração', data_hora + INTERVAL '1 hour', TRUE
-  FROM video WHERE id_video = 1
-RETURNING id_video, seq;                                                        -- seq = último + 1
-ROLLBACK;
-
--- ---- T7: data anterior à postagem e alteração de seq são barradas ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO comentario (id_video, nick_usuario, texto, data_hora, coment_on)
-        SELECT id_video, 'user_1', 'cedo demais', data_hora - INTERVAL '1 day', TRUE
-          FROM video LIMIT 1;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T7 (data)  - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-
-    v_ok := false;
-    BEGIN
-        UPDATE comentario SET seq = 999
-         WHERE (id_video, seq) = (SELECT id_video, seq FROM comentario LIMIT 1);
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T7 (seq)   - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T8 + T16: seq_pg automático e conversão para USD no INSERT ----
-BEGIN;
-INSERT INTO doacao (id_video, seq_comentario, valor_original, status)
-SELECT id_video, seq, 100.00, 'recebido'
-  FROM comentario ORDER BY id_video, seq LIMIT 1
-RETURNING id_video, seq_comentario, seq_pg, valor_original, moeda, valor_usd;
-ROLLBACK;
-
--- T16: a conversão confere com o fator da moeda (esperado = valor_usd)
-SELECT d.id_video, d.seq_comentario, d.seq_pg, d.valor_original, d.moeda,
-       cv.fator_conver, d.valor_usd, ROUND(d.valor_original * cv.fator_conver, 4) AS esperado
-  FROM doacao d JOIN conversao cv ON cv.moeda = d.moeda
- LIMIT 5;
-
--- T16: valor é imutável depois do insert
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        UPDATE doacao SET valor_original = valor_original + 1
-         WHERE (id_video, seq_comentario, seq_pg) =
-               (SELECT id_video, seq_comentario, seq_pg FROM doacao LIMIT 1);
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T16 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T8b: seq_plataforma automático (mecanismo da plataforma) ----
--- (a doação de teste é criada e ligada ao mecanismo na mesma transação)
-BEGIN;
-WITH nova AS (
-    INSERT INTO doacao (id_video, seq_comentario, valor_original, status)
-    SELECT id_video, seq, 50.00, 'lido'
-      FROM comentario ORDER BY id_video, seq LIMIT 1
-    RETURNING id_video, seq_comentario, seq_pg
-)
-INSERT INTO mecanismo_plat (id_video, seq_comentario, seq_pg)
-SELECT id_video, seq_comentario, seq_pg FROM nova
-RETURNING id_video, seq_comentario, seq_pg, seq_plataforma;
-SET CONSTRAINTS ALL IMMEDIATE;                                                  -- T9a satisfeita: sem erro
-ROLLBACK;
-
--- ---- T13: segunda forma de pagamento para a mesma doação ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO paypal (id_video, seq_comentario, seq_pg, id_paypal)
-        SELECT id_video, seq_comentario, seq_pg, 'PP-TESTE-T13' FROM bitcoin LIMIT 1;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T13 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T9a: doação sem forma de pagamento (checada no COMMIT) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO doacao (id_video, seq_comentario, valor_original, status)
-        SELECT id_video, seq, 10.00, 'lido' FROM comentario LIMIT 1;
-        SET CONSTRAINTS ALL IMMEDIATE;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T9a - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T9b: empresa sem país de origem (checada no COMMIT) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO empresa (nome, nome_fantasia) VALUES ('Empresa sem pais', 'Sem Pais');
-        SET CONSTRAINTS ALL IMMEDIATE;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T9b - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T10: convidado sem passaporte (user_9000 não é streamer) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO participa (id_video, nick_streamer) VALUES (1, 'user_9000');
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T10 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T11: apagar o último passaporte de um dono de canal (user_500 só tem um) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        DELETE FROM streamer_pais WHERE nick_streamer = 'user_500';
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T11 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T12: canal com menos de 5 níveis (checado no COMMIT) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        DELETE FROM nivel_canal
-         WHERE (id_canal, nivel) = (SELECT x.id_canal, x.nivel
-                                      FROM nivel_canal x
-                                     WHERE NOT EXISTS (SELECT 1 FROM inscricao i
-                                                        WHERE i.id_canal = x.id_canal
-                                                          AND i.nivel    = x.nivel)
-                                     LIMIT 1);
-        SET CONSTRAINTS ALL IMMEDIATE;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T12 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
-
--- ---- T15: streamer (com passaporte) sem canal (user_9999 não tem canal) ----
-BEGIN;
-DO $$
-DECLARE v_ok boolean := false;
-BEGIN
-    BEGIN
-        INSERT INTO streamer_pais (nick_streamer, ddi_pais, nro_passaporte)
-        VALUES ('user_9999', 1, 'PTESTE-T15');
-        SET CONSTRAINTS ALL IMMEDIATE;
-    EXCEPTION WHEN raise_exception THEN v_ok := true;
-    END;
-    RAISE NOTICE 'T15 - %', CASE WHEN v_ok THEN 'OK (bloqueado)' ELSE 'FALHOU' END;
-END $$;
-ROLLBACK;
+-- Q12: soma dos canais por plataforma = total de canais
+SELECT (SELECT SUM(qtd_canais) FROM fn_q12_top_plataformas(NULL)) AS pela_function,
+       (SELECT COUNT(*) FROM Canal)                               AS direto;
