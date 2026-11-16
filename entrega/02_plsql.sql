@@ -1,905 +1,788 @@
--- =====================================================================
--- PROJETO DE BANCO DE DADOS 2026/2 - UFF - Prof. Marcos Bedo
--- Arquivo 2: PL/pgSQL (triggers, views, functions/procedures)
---
--- Regras "verificado no COMMIT" usam CONSTRAINT TRIGGER DEFERRABLE
--- INITIALLY DEFERRED: a checagem só roda no fim da transação. Por isso a
--- carga de dados roda em uma única transação (BEGIN ... COMMIT).
--- =====================================================================
-
+-- ---------------------------------------------------------------------
+-- Triggers (parte 1), visões e procedure de atualização (parte 2) e
+-- functions de consulta (parte 3).
+-- As visões materializadas nascem vazias aqui; o 03_dados.sql as atualiza
+-- no final com CALL sp_atualizar_visoes().
+-- ---------------------------------------------------------------------
 
 -- #####################################################################
--- PARTE 1 - TRIGGERS
+-- PARTE 1 - TRIGGERS (T01 a T11)
 -- #####################################################################
 
 -- ---------------------------------------------------------------------
--- T1: mantém plataforma.qtd_users ao inserir, apagar ou mover contas
+-- T01: dono de canal e convidado de vídeo precisam ter passaporte
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t1_qtd_users() RETURNS trigger
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION fn_t01_passaporte() RETURNS TRIGGER AS $$
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        UPDATE plataforma SET qtd_users = qtd_users + 1
-         WHERE nro_plataforma = NEW.nro_plataforma;
-    ELSIF TG_OP = 'DELETE' THEN
-        UPDATE plataforma SET qtd_users = qtd_users - 1
-         WHERE nro_plataforma = OLD.nro_plataforma;
-    ELSE  -- UPDATE: conta movida de plataforma
-        IF NEW.nro_plataforma IS DISTINCT FROM OLD.nro_plataforma THEN
-            UPDATE plataforma SET qtd_users = qtd_users - 1
-             WHERE nro_plataforma = OLD.nro_plataforma;
-            UPDATE plataforma SET qtd_users = qtd_users + 1
-             WHERE nro_plataforma = NEW.nro_plataforma;
-        END IF;
-    END IF;
-    RETURN NULL;
-END $$;
-
-CREATE TRIGGER trg_t01_qtd_users
-AFTER INSERT OR DELETE OR UPDATE OF nro_plataforma ON plataforma_usuario
-FOR EACH ROW EXECUTE FUNCTION fn_t1_qtd_users();
-
-
--- ---------------------------------------------------------------------
--- T2: mantém canal.qtd_videos e canal.qtd_visualizacoes a partir dos vídeos
--- (recalcula o canal afetado: simples e sem risco de divergência)
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_recalcular_canal(p_id_canal integer) RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-    UPDATE canal c
-       SET qtd_videos        = (SELECT COUNT(*) FROM video v WHERE v.id_canal = c.id_canal),
-           qtd_visualizacoes = (SELECT COALESCE(SUM(v.visu_total), 0) FROM video v WHERE v.id_canal = c.id_canal)
-     WHERE c.id_canal = p_id_canal;
-END $$;
-
-CREATE OR REPLACE FUNCTION fn_t2_totais_canal() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        PERFORM fn_recalcular_canal(NEW.id_canal);
-    ELSIF TG_OP = 'DELETE' THEN
-        PERFORM fn_recalcular_canal(OLD.id_canal);
-    ELSE  -- UPDATE
-        PERFORM fn_recalcular_canal(NEW.id_canal);
-        IF OLD.id_canal <> NEW.id_canal THEN
-            PERFORM fn_recalcular_canal(OLD.id_canal);
-        END IF;
-    END IF;
-    RETURN NULL;
-END $$;
-
-CREATE TRIGGER trg_t02_totais_canal
-AFTER INSERT OR DELETE OR UPDATE OF id_canal, visu_total ON video
-FOR EACH ROW EXECUTE FUNCTION fn_t2_totais_canal();
-
-
--- ---------------------------------------------------------------------
--- T3: todo canal novo nasce com os 5 níveis de membro
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t3_niveis_padrao() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    INSERT INTO nivel_canal (id_canal, nivel, nome, valor, gif)
-    SELECT NEW.id_canal,
-           n,
-           (ARRAY['Bronze','Prata','Ouro','Platina','Diamante'])[n],
-           (ARRAY[5, 10, 25, 50, 100]::numeric[])[n],
-           'canal_' || NEW.id_canal || '_nivel_' || n || '.gif'
-      FROM generate_series(1, 5) AS n;
-    RETURN NULL;
-END $$;
-
-CREATE TRIGGER trg_t03_niveis_padrao
-AFTER INSERT ON canal
-FOR EACH ROW EXECUTE FUNCTION fn_t3_niveis_padrao();
-
-
--- ---------------------------------------------------------------------
--- T12: canal não pode ficar com menos de 5 níveis (verificado no COMMIT)
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_chk_5_niveis(p_id_canal integer) RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM canal WHERE id_canal = p_id_canal)
-       AND (SELECT COUNT(*) FROM nivel_canal WHERE id_canal = p_id_canal) <> 5 THEN
-        RAISE EXCEPTION 'T12: o canal % deve ter exatamente 5 níveis de membro', p_id_canal;
-    END IF;
-END $$;
-
-CREATE OR REPLACE FUNCTION fn_t12_canal_5_niveis() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF TG_TABLE_NAME = 'canal' THEN
-        PERFORM fn_chk_5_niveis(NEW.id_canal);
-    ELSE
-        PERFORM fn_chk_5_niveis(OLD.id_canal);
-        IF TG_OP = 'UPDATE' THEN
-            IF NEW.id_canal <> OLD.id_canal THEN
-                PERFORM fn_chk_5_niveis(NEW.id_canal);
-            END IF;
-        END IF;
-    END IF;
-    RETURN NULL;
-END $$;
-
-CREATE CONSTRAINT TRIGGER trg_t12_canal
-AFTER INSERT ON canal
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t12_canal_5_niveis();
-
-CREATE CONSTRAINT TRIGGER trg_t12_nivel
-AFTER DELETE OR UPDATE OF id_canal ON nivel_canal
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t12_canal_5_niveis();
-
-
--- ---------------------------------------------------------------------
--- T4: vídeo não pode ser anterior ao início do canal
---     (inserir, mudar a data do vídeo ou movê-lo para outro canal)
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t4_video_data() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_inicio date;
-BEGIN
-    SELECT data_inicio INTO v_inicio FROM canal WHERE id_canal = NEW.id_canal;
-    IF FOUND AND NEW.data_hora::date < v_inicio THEN
-        RAISE EXCEPTION 'T4: o vídeo (%) não pode ser anterior ao início do canal % (%)',
-                        NEW.data_hora, NEW.id_canal, v_inicio;
-    END IF;
-
-    -- mudar a data do vídeo não pode deixar comentário anterior à postagem (T7)
-    IF TG_OP = 'UPDATE' THEN
-        IF NEW.data_hora IS DISTINCT FROM OLD.data_hora THEN
-            IF EXISTS (SELECT 1 FROM comentario
-                        WHERE id_video = NEW.id_video AND data_hora < NEW.data_hora) THEN
-                RAISE EXCEPTION 'T4/T7: o vídeo % possui comentários anteriores à nova data de postagem', NEW.id_video;
-            END IF;
-        END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM StreamerPais WHERE nick_streamer = NEW.nick_streamer
+    ) THEN
+        RAISE EXCEPTION 'T01: % não possui passaporte cadastrado em StreamerPais', NEW.nick_streamer;
     END IF;
     RETURN NEW;
-END $$;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_t04_video_data
-BEFORE INSERT OR UPDATE OF data_hora, id_canal ON video
-FOR EACH ROW EXECUTE FUNCTION fn_t4_video_data();
+CREATE TRIGGER trg_t01_passaporte_canal
+    BEFORE INSERT ON Canal
+    FOR EACH ROW EXECUTE FUNCTION fn_t01_passaporte();
+
+CREATE TRIGGER trg_t01_passaporte_participa
+    BEFORE INSERT ON Participa
+    FOR EACH ROW EXECUTE FUNCTION fn_t01_passaporte();
 
 
 -- ---------------------------------------------------------------------
--- T14: mudar a data de início ou o dono de um canal não pode quebrar
---      regras já existentes (T4, T5, T6; T10 e T15 têm triggers próprios)
+-- T02: não apagar o último passaporte de quem tem canal ou participação
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t14_canal_update() RETURNS trigger
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION fn_t02_ultimo_passaporte() RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.data_inicio IS DISTINCT FROM OLD.data_inicio THEN
-        IF EXISTS (SELECT 1 FROM video
-                    WHERE id_canal = NEW.id_canal
-                      AND data_hora::date < NEW.data_inicio) THEN
-            RAISE EXCEPTION 'T14/T4: o canal % possui vídeos anteriores à nova data de início %',
-                            NEW.id_canal, NEW.data_inicio;
-        END IF;
+    IF EXISTS (SELECT 1 FROM StreamerPais
+                WHERE nick_streamer = OLD.nick_streamer AND ddi_pais <> OLD.ddi_pais) THEN
+        RETURN OLD;
     END IF;
-
-    IF NEW.nick_streamer IS DISTINCT FROM OLD.nick_streamer THEN
-        IF EXISTS (SELECT 1
-                     FROM participa p
-                     JOIN video v ON v.id_video = p.id_video
-                    WHERE v.id_canal = NEW.id_canal
-                      AND p.nick_streamer = NEW.nick_streamer) THEN
-            RAISE EXCEPTION 'T14/T5: % é convidado de vídeos do canal % e não pode ser o novo dono',
-                            NEW.nick_streamer, NEW.id_canal;
-        END IF;
-        IF EXISTS (SELECT 1 FROM inscricao
-                    WHERE id_canal = NEW.id_canal
-                      AND nick_membro = NEW.nick_streamer) THEN
-            RAISE EXCEPTION 'T14/T6: % é membro do canal % e não pode ser o novo dono',
-                            NEW.nick_streamer, NEW.id_canal;
-        END IF;
+    IF EXISTS (SELECT 1 FROM Canal WHERE nick_streamer = OLD.nick_streamer)
+       OR EXISTS (SELECT 1 FROM Participa WHERE nick_streamer = OLD.nick_streamer) THEN
+        RAISE EXCEPTION 'T02: não é possível remover o último passaporte de %, pois o usuário possui canal ou participação', OLD.nick_streamer;
     END IF;
-    RETURN NEW;
-END $$;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_t14_canal_update
-BEFORE UPDATE OF data_inicio, nick_streamer ON canal
-FOR EACH ROW EXECUTE FUNCTION fn_t14_canal_update();
+CREATE TRIGGER trg_t02_ultimo_passaporte
+    BEFORE DELETE ON StreamerPais
+    FOR EACH ROW EXECUTE FUNCTION fn_t02_ultimo_passaporte();
 
 
 -- ---------------------------------------------------------------------
--- T5: o dono do canal não pode constar como convidado do próprio vídeo
---     (também ao mover o vídeo para outro canal)
+-- T03: uma doação aparece em no máximo um meio de pagamento (na inserção)
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t5_convidado() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_dono varchar;
+CREATE FUNCTION fn_t03_forma_unica() RETURNS TRIGGER AS $$
 BEGIN
-    SELECT c.nick_streamer INTO v_dono
-      FROM video v JOIN canal c ON c.id_canal = v.id_canal
-     WHERE v.id_video = NEW.id_video;
-    IF v_dono = NEW.nick_streamer THEN
-        RAISE EXCEPTION 'T5: % é dono do canal e não pode ser convidado do próprio vídeo %',
-                        NEW.nick_streamer, NEW.id_video;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t05_convidado
-BEFORE INSERT OR UPDATE OF id_video, nick_streamer ON participa
-FOR EACH ROW EXECUTE FUNCTION fn_t5_convidado();
-
-CREATE OR REPLACE FUNCTION fn_t5_mover_video() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (SELECT 1
-                 FROM participa p
-                 JOIN canal c ON c.id_canal = NEW.id_canal
-                WHERE p.id_video = NEW.id_video
-                  AND p.nick_streamer = c.nick_streamer) THEN
-        RAISE EXCEPTION 'T5: o dono do canal destino é convidado do vídeo %', NEW.id_video;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t05_mover_video
-BEFORE UPDATE OF id_canal ON video
-FOR EACH ROW EXECUTE FUNCTION fn_t5_mover_video();
-
-
--- ---------------------------------------------------------------------
--- T6: o dono do canal não pode ser membro dele
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t6_membro() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_dono varchar;
-BEGIN
-    SELECT nick_streamer INTO v_dono FROM canal WHERE id_canal = NEW.id_canal;
-    IF v_dono = NEW.nick_membro THEN
-        RAISE EXCEPTION 'T6: % é dono do canal % e não pode ser membro dele',
-                        NEW.nick_membro, NEW.id_canal;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t06_membro
-BEFORE INSERT OR UPDATE OF nick_membro, id_canal ON inscricao
-FOR EACH ROW EXECUTE FUNCTION fn_t6_membro();
-
-
--- ---------------------------------------------------------------------
--- T7: numera o comentário por vídeo (1,2,3...), exige data >= postagem do
---     vídeo e impede alterar id_video e seq
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t7_comentario() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_postagem timestamp;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        -- trava a linha do vídeo: serializa a numeração concorrente
-        SELECT data_hora INTO v_postagem
-          FROM video WHERE id_video = NEW.id_video
-           FOR NO KEY UPDATE;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'T7: vídeo % inexistente', NEW.id_video;
-        END IF;
-        IF NEW.data_hora < v_postagem THEN
-            RAISE EXCEPTION 'T7: o comentário (%) não pode ser anterior à postagem do vídeo (%)',
-                            NEW.data_hora, v_postagem;
-        END IF;
-        SELECT COALESCE(MAX(seq), 0) + 1 INTO NEW.seq
-          FROM comentario WHERE id_video = NEW.id_video;
-    ELSE
-        IF NEW.id_video IS DISTINCT FROM OLD.id_video OR NEW.seq IS DISTINCT FROM OLD.seq THEN
-            RAISE EXCEPTION 'T7: id_video e seq do comentário não podem ser alterados';
-        END IF;
-        IF NEW.data_hora IS DISTINCT FROM OLD.data_hora THEN
-            SELECT data_hora INTO v_postagem FROM video WHERE id_video = NEW.id_video;
-            IF NEW.data_hora < v_postagem THEN
-                RAISE EXCEPTION 'T7: o comentário (%) não pode ser anterior à postagem do vídeo (%)',
-                                NEW.data_hora, v_postagem;
-            END IF;
-        END IF;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t07_comentario
-BEFORE INSERT OR UPDATE ON comentario
-FOR EACH ROW EXECUTE FUNCTION fn_t7_comentario();
-
-
--- ---------------------------------------------------------------------
--- T8: numera seq_pg (doação) por comentário
--- T8b: numera seq_plataforma (mecanismo da plataforma) por comentário
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t8_seq_pg() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- trava o comentário para serializar a numeração concorrente
-    PERFORM 1 FROM comentario
-     WHERE id_video = NEW.id_video AND seq = NEW.seq_comentario
-       FOR NO KEY UPDATE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'T8: comentário (%, %) inexistente', NEW.id_video, NEW.seq_comentario;
-    END IF;
-    SELECT COALESCE(MAX(seq_pg), 0) + 1 INTO NEW.seq_pg
-      FROM doacao
-     WHERE id_video = NEW.id_video AND seq_comentario = NEW.seq_comentario;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t08_seq_pg
-BEFORE INSERT ON doacao
-FOR EACH ROW EXECUTE FUNCTION fn_t8_seq_pg();
-
-CREATE OR REPLACE FUNCTION fn_t8b_seq_plataforma() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM comentario
-     WHERE id_video = NEW.id_video AND seq = NEW.seq_comentario
-       FOR NO KEY UPDATE;
-    SELECT COALESCE(MAX(seq_plataforma), 0) + 1 INTO NEW.seq_plataforma
-      FROM mecanismo_plat
-     WHERE id_video = NEW.id_video AND seq_comentario = NEW.seq_comentario;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t08b_seq_plataforma
-BEFORE INSERT ON mecanismo_plat
-FOR EACH ROW EXECUTE FUNCTION fn_t8b_seq_plataforma();
-
-
--- ---------------------------------------------------------------------
--- T16: converte a doação para USD no momento do INSERT (moeda do país de
---      residência de quem comentou) e torna o valor imutável depois disso
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t16_conversao_doacao() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_moeda varchar;
-    v_fator numeric;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        SELECT cv.moeda, cv.fator_conver
-          INTO v_moeda, v_fator
-          FROM comentario c
-          JOIN usuario  u  ON u.nick = c.nick_usuario
-          JOIN pais     p  ON p.ddi  = u.pais_residencia
-          JOIN conversao cv ON cv.moeda = p.moeda
-         WHERE c.id_video = NEW.id_video
-           AND c.seq      = NEW.seq_comentario;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'T16: não foi possível obter a moeda da doação (comentário %, % inexistente)',
-                            NEW.id_video, NEW.seq_comentario;
-        END IF;
-        NEW.moeda     := v_moeda;                                     -- sobrescreve qualquer valor informado
-        NEW.valor_usd := ROUND(NEW.valor_original * v_fator, 4);
-    ELSE
-        IF NEW.valor_original IS DISTINCT FROM OLD.valor_original
-           OR NEW.moeda       IS DISTINCT FROM OLD.moeda
-           OR NEW.valor_usd   IS DISTINCT FROM OLD.valor_usd
-           OR NEW.id_video    IS DISTINCT FROM OLD.id_video
-           OR NEW.seq_comentario IS DISTINCT FROM OLD.seq_comentario
-           OR NEW.seq_pg      IS DISTINCT FROM OLD.seq_pg THEN
-            RAISE EXCEPTION 'T16: valor, moeda e identificação da doação são imutáveis (só o status muda)';
-        END IF;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t16_conversao_doacao
-BEFORE INSERT OR UPDATE ON doacao
-FOR EACH ROW EXECUTE FUNCTION fn_t16_conversao_doacao();
-
-
--- ---------------------------------------------------------------------
--- T13: uma doação aparece em no máximo uma forma de pagamento
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t13_forma_unica() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF (TG_TABLE_NAME <> 'bitcoin' AND EXISTS (
-            SELECT 1 FROM bitcoin x
-             WHERE x.id_video = NEW.id_video AND x.seq_comentario = NEW.seq_comentario AND x.seq_pg = NEW.seq_pg))
-    OR (TG_TABLE_NAME <> 'paypal' AND EXISTS (
-            SELECT 1 FROM paypal x
-             WHERE x.id_video = NEW.id_video AND x.seq_comentario = NEW.seq_comentario AND x.seq_pg = NEW.seq_pg))
-    OR (TG_TABLE_NAME <> 'cartao_credito' AND EXISTS (
-            SELECT 1 FROM cartao_credito x
-             WHERE x.id_video = NEW.id_video AND x.seq_comentario = NEW.seq_comentario AND x.seq_pg = NEW.seq_pg))
-    OR (TG_TABLE_NAME <> 'mecanismo_plat' AND EXISTS (
-            SELECT 1 FROM mecanismo_plat x
-             WHERE x.id_video = NEW.id_video AND x.seq_comentario = NEW.seq_comentario AND x.seq_pg = NEW.seq_pg))
+    IF (TG_TABLE_NAME <> 'cartaocredito' AND EXISTS (SELECT 1 FROM CartaoCredito WHERE id_comentario = NEW.id_comentario))
+    OR (TG_TABLE_NAME <> 'bitcoin'       AND EXISTS (SELECT 1 FROM BitCoin       WHERE id_comentario = NEW.id_comentario))
+    OR (TG_TABLE_NAME <> 'paypal'        AND EXISTS (SELECT 1 FROM PayPal        WHERE id_comentario = NEW.id_comentario))
+    OR (TG_TABLE_NAME <> 'mecanismoplat' AND EXISTS (SELECT 1 FROM MecanismoPlat WHERE id_comentario = NEW.id_comentario))
     THEN
-        RAISE EXCEPTION 'T13: a doação (%, %, %) já possui outra forma de pagamento',
-                        NEW.id_video, NEW.seq_comentario, NEW.seq_pg;
+        RAISE EXCEPTION 'T03: a doação % já possui outra forma de pagamento', NEW.id_comentario;
     END IF;
     RETURN NEW;
-END $$;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_t13_bitcoin        BEFORE INSERT OR UPDATE ON bitcoin
-FOR EACH ROW EXECUTE FUNCTION fn_t13_forma_unica();
-CREATE TRIGGER trg_t13_paypal         BEFORE INSERT OR UPDATE ON paypal
-FOR EACH ROW EXECUTE FUNCTION fn_t13_forma_unica();
-CREATE TRIGGER trg_t13_cartao_credito BEFORE INSERT OR UPDATE ON cartao_credito
-FOR EACH ROW EXECUTE FUNCTION fn_t13_forma_unica();
-CREATE TRIGGER trg_t13_mecanismo_plat BEFORE INSERT OR UPDATE ON mecanismo_plat
-FOR EACH ROW EXECUTE FUNCTION fn_t13_forma_unica();
+CREATE TRIGGER trg_t03_forma_unica_cartao    BEFORE INSERT ON CartaoCredito FOR EACH ROW EXECUTE FUNCTION fn_t03_forma_unica();
+CREATE TRIGGER trg_t03_forma_unica_bitcoin   BEFORE INSERT ON BitCoin       FOR EACH ROW EXECUTE FUNCTION fn_t03_forma_unica();
+CREATE TRIGGER trg_t03_forma_unica_paypal    BEFORE INSERT ON PayPal        FOR EACH ROW EXECUTE FUNCTION fn_t03_forma_unica();
+CREATE TRIGGER trg_t03_forma_unica_mecanismo BEFORE INSERT ON MecanismoPlat FOR EACH ROW EXECUTE FUNCTION fn_t03_forma_unica();
 
 
 -- ---------------------------------------------------------------------
--- T9a: uma doação tem exatamente uma forma de pagamento (verificado no COMMIT)
+-- T04: toda doação tem exatamente uma forma de pagamento (deferido, no COMMIT)
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_chk_forma_pagamento(p_video integer, p_coment integer, p_pg integer) RETURNS void
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION fn_t04_chk_forma_completa(p_id_comentario INTEGER) RETURNS VOID AS $$
 DECLARE
-    v_qtd integer;
+    v_qtd INTEGER;
 BEGIN
-    IF EXISTS (SELECT 1 FROM doacao
-                WHERE id_video = p_video AND seq_comentario = p_coment AND seq_pg = p_pg) THEN
-        SELECT (SELECT COUNT(*) FROM bitcoin        WHERE id_video = p_video AND seq_comentario = p_coment AND seq_pg = p_pg)
-             + (SELECT COUNT(*) FROM paypal         WHERE id_video = p_video AND seq_comentario = p_coment AND seq_pg = p_pg)
-             + (SELECT COUNT(*) FROM cartao_credito WHERE id_video = p_video AND seq_comentario = p_coment AND seq_pg = p_pg)
-             + (SELECT COUNT(*) FROM mecanismo_plat WHERE id_video = p_video AND seq_comentario = p_coment AND seq_pg = p_pg)
+    IF EXISTS (SELECT 1 FROM Doacao WHERE id_comentario = p_id_comentario) THEN
+        SELECT (SELECT COUNT(*) FROM CartaoCredito WHERE id_comentario = p_id_comentario)
+             + (SELECT COUNT(*) FROM BitCoin       WHERE id_comentario = p_id_comentario)
+             + (SELECT COUNT(*) FROM PayPal        WHERE id_comentario = p_id_comentario)
+             + (SELECT COUNT(*) FROM MecanismoPlat WHERE id_comentario = p_id_comentario)
           INTO v_qtd;
         IF v_qtd <> 1 THEN
-            RAISE EXCEPTION 'T9a: a doação (%, %, %) deve ter exatamente uma forma de pagamento (tem %)',
-                            p_video, p_coment, p_pg, v_qtd;
+            RAISE EXCEPTION 'T04: a doação % deve ter exatamente uma forma de pagamento (tem %)', p_id_comentario, v_qtd;
         END IF;
     END IF;
-END $$;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION fn_t9a_forma_obrigatoria() RETURNS trigger
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION fn_t04_forma_completa() RETURNS TRIGGER AS $$
 BEGIN
-    IF TG_OP IN ('INSERT', 'UPDATE') THEN
-        PERFORM fn_chk_forma_pagamento(NEW.id_video, NEW.seq_comentario, NEW.seq_pg);
-    END IF;
-    IF TG_OP IN ('DELETE', 'UPDATE') THEN
-        PERFORM fn_chk_forma_pagamento(OLD.id_video, OLD.seq_comentario, OLD.seq_pg);
+    IF TG_TABLE_NAME = 'doacao' THEN
+        PERFORM fn_t04_chk_forma_completa(NEW.id_comentario);
+    ELSE
+        PERFORM fn_t04_chk_forma_completa(OLD.id_comentario);
     END IF;
     RETURN NULL;
-END $$;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE CONSTRAINT TRIGGER trg_t09a_doacao
-AFTER INSERT ON doacao
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9a_forma_obrigatoria();
+CREATE CONSTRAINT TRIGGER trg_t04_forma_completa_doacao
+    AFTER INSERT ON Doacao
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t04_forma_completa();
 
-CREATE CONSTRAINT TRIGGER trg_t09a_bitcoin
-AFTER DELETE OR UPDATE ON bitcoin
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9a_forma_obrigatoria();
-CREATE CONSTRAINT TRIGGER trg_t09a_paypal
-AFTER DELETE OR UPDATE ON paypal
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9a_forma_obrigatoria();
-CREATE CONSTRAINT TRIGGER trg_t09a_cartao_credito
-AFTER DELETE OR UPDATE ON cartao_credito
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9a_forma_obrigatoria();
-CREATE CONSTRAINT TRIGGER trg_t09a_mecanismo_plat
-AFTER DELETE OR UPDATE ON mecanismo_plat
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9a_forma_obrigatoria();
+CREATE CONSTRAINT TRIGGER trg_t04_forma_completa_cartao
+    AFTER DELETE ON CartaoCredito
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t04_forma_completa();
+
+CREATE CONSTRAINT TRIGGER trg_t04_forma_completa_bitcoin
+    AFTER DELETE ON BitCoin
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t04_forma_completa();
+
+CREATE CONSTRAINT TRIGGER trg_t04_forma_completa_paypal
+    AFTER DELETE ON PayPal
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t04_forma_completa();
+
+CREATE CONSTRAINT TRIGGER trg_t04_forma_completa_mecanismo
+    AFTER DELETE ON MecanismoPlat
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t04_forma_completa();
 
 
 -- ---------------------------------------------------------------------
--- T9b: toda empresa tem ao menos um país de origem (verificado no COMMIT)
+-- T05: todo canal tem exatamente cinco níveis (deferido, no COMMIT)
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_chk_empresa_pais(p_id_empresa integer) RETURNS void
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION fn_t05_cinco_niveis() RETURNS TRIGGER AS $$
+DECLARE
+    v_canal INTEGER;
+    v_qtd   INTEGER;
 BEGIN
-    IF EXISTS (SELECT 1 FROM empresa WHERE id_empresa = p_id_empresa)
-       AND NOT EXISTS (SELECT 1 FROM empresa_pais WHERE id_empresa = p_id_empresa) THEN
-        RAISE EXCEPTION 'T9b: a empresa % deve ter ao menos um país de origem', p_id_empresa;
+    v_canal := COALESCE(NEW.id_canal, OLD.id_canal);
+    IF NOT EXISTS (SELECT 1 FROM Canal WHERE id_canal = v_canal) THEN
+        RETURN NULL;
     END IF;
-END $$;
+    SELECT COUNT(*) INTO v_qtd FROM NivelCanal WHERE id_canal = v_canal;
+    IF v_qtd <> 5 THEN
+        RAISE EXCEPTION 'T05: o canal % deve ter exatamente 5 níveis (tem %)', v_canal, v_qtd;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION fn_t9b_empresa_pais() RETURNS trigger
-LANGUAGE plpgsql AS $$
+CREATE CONSTRAINT TRIGGER trg_t05_cinco_niveis
+    AFTER INSERT OR DELETE ON NivelCanal
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t05_cinco_niveis();
+
+
+-- ---------------------------------------------------------------------
+-- T06: converte a doação para USD na gravação
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t06_conversao_doacao() RETURNS TRIGGER AS $$
+DECLARE
+    v_fator NUMERIC(12,6);
+BEGIN
+    SELECT fator_conver INTO v_fator FROM Conversao WHERE moeda = NEW.moeda;
+    NEW.valor := ROUND(NEW.valor_original * v_fator, 2);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_t06_conversao_doacao
+    BEFORE INSERT ON Doacao
+    FOR EACH ROW EXECUTE FUNCTION fn_t06_conversao_doacao();
+
+
+-- ---------------------------------------------------------------------
+-- T07: vídeo não pode ser anterior ao início do canal
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t07_video_inicio_canal() RETURNS TRIGGER AS $$
+DECLARE
+    v_inicio DATE;
+BEGIN
+    SELECT data_inicio INTO v_inicio FROM Canal WHERE id_canal = NEW.id_canal;
+    IF NEW.dataH::date < v_inicio THEN
+        RAISE EXCEPTION 'T07: o vídeo (%) é anterior ao início do canal % (%)', NEW.dataH, NEW.id_canal, v_inicio;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_t07_video_inicio_canal
+    BEFORE INSERT ON Video
+    FOR EACH ROW EXECUTE FUNCTION fn_t07_video_inicio_canal();
+
+
+-- ---------------------------------------------------------------------
+-- T08: dono do canal não pode ser convidado do próprio vídeo
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t08_convidado_nao_dono() RETURNS TRIGGER AS $$
+DECLARE
+    v_dono VARCHAR;
+BEGIN
+    SELECT c.nick_streamer INTO v_dono
+      FROM Video v JOIN Canal c ON c.id_canal = v.id_canal
+     WHERE v.id_video = NEW.id_video;
+    IF v_dono = NEW.nick_streamer THEN
+        RAISE EXCEPTION 'T08: % é dono do canal e não pode ser convidado do vídeo %', NEW.nick_streamer, NEW.id_video;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_t08_convidado_nao_dono
+    BEFORE INSERT ON Participa
+    FOR EACH ROW EXECUTE FUNCTION fn_t08_convidado_nao_dono();
+
+
+-- ---------------------------------------------------------------------
+-- T09: dono do canal não pode ser membro dele
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t09_membro_nao_dono() RETURNS TRIGGER AS $$
+DECLARE
+    v_dono VARCHAR;
+BEGIN
+    SELECT nick_streamer INTO v_dono FROM Canal WHERE id_canal = NEW.id_canal;
+    IF v_dono = NEW.nick_membro THEN
+        RAISE EXCEPTION 'T09: % é dono do canal % e não pode ser membro dele', NEW.nick_membro, NEW.id_canal;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_t09_membro_nao_dono
+    BEFORE INSERT ON Inscricao
+    FOR EACH ROW EXECUTE FUNCTION fn_t09_membro_nao_dono();
+
+
+-- ---------------------------------------------------------------------
+-- T10: comentário não pode ser anterior à postagem do vídeo
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t10_comentario_apos_postagem() RETURNS TRIGGER AS $$
+DECLARE
+    v_postagem TIMESTAMP;
+BEGIN
+    SELECT dataH INTO v_postagem FROM Video WHERE id_video = NEW.id_video;
+    IF NEW.dataH < v_postagem THEN
+        RAISE EXCEPTION 'T10: o comentário (%) é anterior à postagem do vídeo (%)', NEW.dataH, v_postagem;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_t10_comentario_apos_postagem
+    BEFORE INSERT ON Comentario
+    FOR EACH ROW EXECUTE FUNCTION fn_t10_comentario_apos_postagem();
+
+
+-- ---------------------------------------------------------------------
+-- T11: toda empresa tem ao menos um país de origem (deferido, no COMMIT)
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_t11_chk_empresa_pais(p_nro INTEGER) RETURNS VOID AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM Empresa WHERE nro = p_nro)
+       AND NOT EXISTS (SELECT 1 FROM EmpresaPais WHERE nro_empresa = p_nro) THEN
+        RAISE EXCEPTION 'T11: a empresa % deve ter ao menos um país de origem', p_nro;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION fn_t11_empresa_com_pais() RETURNS TRIGGER AS $$
 BEGIN
     IF TG_TABLE_NAME = 'empresa' THEN
-        PERFORM fn_chk_empresa_pais(NEW.id_empresa);
+        PERFORM fn_t11_chk_empresa_pais(NEW.nro);
     ELSE
-        PERFORM fn_chk_empresa_pais(OLD.id_empresa);
+        PERFORM fn_t11_chk_empresa_pais(OLD.nro_empresa);
     END IF;
     RETURN NULL;
-END $$;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE CONSTRAINT TRIGGER trg_t09b_empresa
-AFTER INSERT ON empresa
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9b_empresa_pais();
+CREATE CONSTRAINT TRIGGER trg_t11_empresa_com_pais_empresa
+    AFTER INSERT ON Empresa
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t11_empresa_com_pais();
 
-CREATE CONSTRAINT TRIGGER trg_t09b_empresa_pais
-AFTER DELETE OR UPDATE OF id_empresa ON empresa_pais
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t9b_empresa_pais();
-
-
--- ---------------------------------------------------------------------
--- T10: dono de canal e convidado de vídeo precisam ter passaporte
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t10_passaporte() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM streamer_pais WHERE nick_streamer = NEW.nick_streamer) THEN
-        RAISE EXCEPTION 'T10: % não possui passaporte e não pode ser dono de canal nem convidado', NEW.nick_streamer;
-    END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t10_canal
-BEFORE INSERT OR UPDATE OF nick_streamer ON canal
-FOR EACH ROW EXECUTE FUNCTION fn_t10_passaporte();
-
-CREATE TRIGGER trg_t10_participa
-BEFORE INSERT OR UPDATE OF nick_streamer ON participa
-FOR EACH ROW EXECUTE FUNCTION fn_t10_passaporte();
-
-
--- ---------------------------------------------------------------------
--- T11: não deixa apagar o último passaporte de quem é dono de canal
---      ou convidado de vídeo
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_t11_ultimo_passaporte() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF TG_OP = 'UPDATE' THEN
-        IF NEW.nick_streamer = OLD.nick_streamer THEN
-            RETURN NEW;                               -- o dono do passaporte não mudou
-        END IF;
-    END IF;
-    IF (SELECT COUNT(*) FROM streamer_pais WHERE nick_streamer = OLD.nick_streamer) = 1
-       AND (EXISTS (SELECT 1 FROM canal    WHERE nick_streamer = OLD.nick_streamer)
-         OR EXISTS (SELECT 1 FROM participa WHERE nick_streamer = OLD.nick_streamer)) THEN
-        RAISE EXCEPTION 'T11: este é o último passaporte de %, que é dono de canal ou convidado de vídeo',
-                        OLD.nick_streamer;
-    END IF;
-    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-    RETURN NEW;
-END $$;
-
-CREATE TRIGGER trg_t11_ultimo_passaporte
-BEFORE DELETE OR UPDATE OF nick_streamer ON streamer_pais
-FOR EACH ROW EXECUTE FUNCTION fn_t11_ultimo_passaporte();
-
-
--- ---------------------------------------------------------------------
--- T15: todo streamer (com passaporte) tem ao menos um canal
---      (verificado no COMMIT)
--- ---------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_chk_streamer_canal(p_nick varchar) RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM streamer_pais WHERE nick_streamer = p_nick)
-       AND NOT EXISTS (SELECT 1 FROM canal WHERE nick_streamer = p_nick) THEN
-        RAISE EXCEPTION 'T15: o streamer % deve ter ao menos um canal', p_nick;
-    END IF;
-END $$;
-
-CREATE OR REPLACE FUNCTION fn_t15_streamer_canal() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF TG_TABLE_NAME = 'streamer_pais' THEN
-        PERFORM fn_chk_streamer_canal(NEW.nick_streamer);
-    ELSE                                              -- canal apagado ou trocou de dono
-        PERFORM fn_chk_streamer_canal(OLD.nick_streamer);
-    END IF;
-    RETURN NULL;
-END $$;
-
-CREATE CONSTRAINT TRIGGER trg_t15_streamer
-AFTER INSERT OR UPDATE OF nick_streamer ON streamer_pais
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t15_streamer_canal();
-
-CREATE CONSTRAINT TRIGGER trg_t15_canal
-AFTER DELETE OR UPDATE OF nick_streamer ON canal
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION fn_t15_streamer_canal();
+CREATE CONSTRAINT TRIGGER trg_t11_empresa_com_pais_vinculo
+    AFTER DELETE ON EmpresaPais
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_t11_empresa_com_pais();
 
 
 -- #####################################################################
--- PARTE 2 - VISÕES (5): 2 materializadas e 3 virtuais
--- Obs.: nenhuma visão materializada tem índice próprio, para respeitar o
--- limite de 5 índices (4 já usados). Por isso o refresh é o completo
--- (sp_atualizar_visoes), não o CONCURRENTLY.
+-- PARTE 2 - VISÕES (5) E PROCEDURE DE ATUALIZAÇÃO
 -- #####################################################################
 
--- Comentários por vídeo (online/offline/total). LEFT JOIN mantém vídeos sem
--- comentário. Alimenta Q2 e Q3.
-CREATE MATERIALIZED VIEW mv_video_comentarios AS
+-- Resumo (até 5 visões):
+--   V1 vw_comentarios_video  MATERIALIZADA  consultas 2 e 3
+--   V2 vw_doacao_canal       MATERIALIZADA  consultas 4, 7, 10 e 11
+--   V3 vw_patrocinio_canal   virtual        consultas 8 e 11
+--   V4 vw_membros_canal      virtual        consultas 9 e 11
+--   V5 vw_receita_canal      virtual        consulta 11
+-- Nenhuma materializada tem índice próprio: cerca de 1.000 linhas cada, e a
+-- vaga de índice rende mais numa tabela base (idx_canal_streamer, no DDL).
+-- Atualização: CALL sp_atualizar_visoes(); após qualquer carga nova.
+
+-- ---------------------------------------------------------------------
+-- V1 (materializada): comentários online, offline e total por vídeo.
+-- LEFT JOIN: vídeo sem comentário aparece com zeros. Sem isso, a média de
+-- interações por vídeo (consulta 3) sairia inflada.
+-- Materializada porque varre Video x Comentario inteira (a maior junção do
+-- banco) e a defasagem é aceitável entre cargas.
+-- ---------------------------------------------------------------------
+CREATE MATERIALIZED VIEW vw_comentarios_video AS
 SELECT v.id_video,
        v.id_canal,
-       COUNT(c.seq) FILTER (WHERE c.coment_on)     AS qtd_online,
-       COUNT(c.seq) FILTER (WHERE NOT c.coment_on) AS qtd_offline,
-       COUNT(c.seq)                                AS qtd_total
-  FROM video v
-  LEFT JOIN comentario c ON c.id_video = v.id_video
- GROUP BY v.id_video, v.id_canal;
+       v.titulo,
+       v.dataH,
+       COUNT(c.id_comentario) FILTER (WHERE c.coment_on)     AS qtd_online,
+       COUNT(c.id_comentario) FILTER (WHERE NOT c.coment_on) AS qtd_offline,
+       COUNT(c.id_comentario)                                AS qtd_total
+  FROM Video v
+  LEFT JOIN Comentario c ON c.id_video = v.id_video
+ GROUP BY v.id_video, v.id_canal, v.titulo, v.dataH;
 
--- Doações por canal, já em USD (valor_usd é gravado pelo trigger T16).
--- Doações 'recusado' não entram na arrecadação. Alimenta Q4, Q7, Q10 e Q11.
--- qtd_comentarios_com_doacao é a base da média "por comentário" (Q4).
-CREATE MATERIALIZED VIEW mv_canal_doacoes AS
-SELECT v.id_canal,
-       COUNT(*)                                         AS qtd_doacoes,
-       COUNT(DISTINCT (d.id_video, d.seq_comentario))   AS qtd_comentarios_com_doacao,
-       SUM(d.valor_usd)                                 AS valor_total_usd
-  FROM doacao d
-  JOIN video v ON v.id_video = d.id_video
+
+-- ---------------------------------------------------------------------
+-- V2 (materializada): doações por canal, em USD.
+-- Premissa: doação com status 'recusado' não gerou dinheiro e fica de fora.
+-- INNER JOIN: só aparecem canais que já receberam doação (consulta 7).
+-- nro_plataforma vai na view para o filtro da consulta 4, sem junção extra.
+-- Materializada porque faz Doacao -> Comentario -> Video -> Canal.
+-- ---------------------------------------------------------------------
+CREATE MATERIALIZED VIEW vw_doacao_canal AS
+SELECT ca.id_canal,
+       ca.nro_plataforma,
+       COUNT(*)                AS qtd_doacoes,
+       SUM(d.valor)            AS soma_usd,
+       ROUND(AVG(d.valor), 2)  AS media_usd
+  FROM Doacao d
+  JOIN Comentario co ON co.id_comentario = d.id_comentario
+  JOIN Video v       ON v.id_video       = co.id_video
+  JOIN Canal ca      ON ca.id_canal      = v.id_canal
  WHERE d.status <> 'recusado'
- GROUP BY v.id_canal;
+ GROUP BY ca.id_canal, ca.nro_plataforma;
 
--- Patrocínio vigente por canal (tabela pequena: virtual, sempre atual).
-CREATE VIEW vw_canal_patrocinio AS
-SELECT p.id_canal,
-       COUNT(*)     AS qtd_patrocinios,
-       SUM(p.valor) AS valor_total_usd
-  FROM patrocinio p
- GROUP BY p.id_canal;
+-- Nenhuma visão materializada tem índice próprio: cada uma tem cerca de
+-- 1.000 linhas, e a 5ª vaga de índice rende mais numa tabela base
+-- (idx_canal_streamer, no 01_ddl.sql).
 
--- Membros vigentes por canal e aporte mensal (virtual: entram e saem a
--- qualquer momento).
-CREATE VIEW vw_canal_membros AS
+
+-- ---------------------------------------------------------------------
+-- V3 (virtual): patrocínio vigente somado por canal.
+-- Virtual porque a agregação é barata e o dado precisa estar sempre atual.
+-- ---------------------------------------------------------------------
+CREATE VIEW vw_patrocinio_canal AS
+SELECT id_canal,
+       COUNT(*)   AS qtd_patrocinadores,
+       SUM(valor) AS soma_patrocinio
+  FROM Patrocinio
+ GROUP BY id_canal;
+
+
+-- ---------------------------------------------------------------------
+-- V4 (virtual): aporte mensal de membros por canal.
+-- O valor vem do nível do membro (Inscricao -> NivelCanal).
+-- ---------------------------------------------------------------------
+CREATE VIEW vw_membros_canal AS
 SELECT i.id_canal,
        COUNT(*)     AS qtd_membros,
-       SUM(n.valor) AS valor_mensal_usd
-  FROM inscricao i
-  JOIN nivel_canal n ON n.id_canal = i.id_canal AND n.nivel = i.nivel
+       SUM(n.valor) AS soma_mensal_usd
+  FROM Inscricao i
+  JOIN NivelCanal n ON n.id_canal = i.id_canal
+                   AND n.nivel    = i.nivel
  GROUP BY i.id_canal;
 
--- Faturamento por canal nas três fontes (patrocínio + membros/mês + doações).
-CREATE VIEW vw_canal_faturamento AS
-SELECT c.id_canal,
-       COALESCE(p.valor_total_usd, 0)   AS patrocinio_usd,
-       COALESCE(m.valor_mensal_usd, 0)  AS membros_usd,
-       COALESCE(d.valor_total_usd, 0)   AS doacoes_usd,
-       COALESCE(p.valor_total_usd, 0)
-     + COALESCE(m.valor_mensal_usd, 0)
-     + COALESCE(d.valor_total_usd, 0)   AS faturamento_total_usd
-  FROM canal c
-  LEFT JOIN vw_canal_patrocinio p ON p.id_canal = c.id_canal
-  LEFT JOIN vw_canal_membros    m ON m.id_canal = c.id_canal
-  LEFT JOIN mv_canal_doacoes    d ON d.id_canal = c.id_canal;
 
--- Atualiza as visões materializadas (chamar após cargas e antes das consultas)
-CREATE OR REPLACE PROCEDURE sp_atualizar_visoes()
+-- ---------------------------------------------------------------------
+-- V5 (virtual): receita total por canal (patrocínio + membros + doações).
+-- Cada fonte já chega agregada em uma linha por canal (V3, V4, V2), então
+-- a junção não multiplica linhas e as somas saem corretas. Juntar as
+-- tabelas cruas de uma vez inflaria cada fonte pelas outras.
+-- LEFT JOIN + COALESCE: canal sem alguma das fontes entra com zero.
+-- ---------------------------------------------------------------------
+CREATE VIEW vw_receita_canal AS
+SELECT c.id_canal,
+       c.nome,
+       c.nro_plataforma,
+       COALESCE(p.soma_patrocinio,  0) AS patrocinio,
+       COALESCE(m.soma_mensal_usd,  0) AS membros,
+       COALESCE(d.soma_usd,         0) AS doacoes,
+       COALESCE(p.soma_patrocinio,  0)
+     + COALESCE(m.soma_mensal_usd,  0)
+     + COALESCE(d.soma_usd,         0) AS total
+  FROM Canal c
+  LEFT JOIN vw_patrocinio_canal p ON p.id_canal = c.id_canal
+  LEFT JOIN vw_membros_canal    m ON m.id_canal = c.id_canal
+  LEFT JOIN vw_doacao_canal     d ON d.id_canal = c.id_canal;
+
+
+-- ---------------------------------------------------------------------
+-- Atualização das materializadas: CALL sp_atualizar_visoes();
+-- Chamar depois de qualquer carga nova, inclusive depois do 04_testes.sql,
+-- que insere comentários e doações. O refresh é o completo (sem
+-- CONCURRENTLY), pois as visões não têm índice único.
+-- ---------------------------------------------------------------------
+CREATE PROCEDURE sp_atualizar_visoes()
 LANGUAGE plpgsql AS $$
 BEGIN
-    REFRESH MATERIALIZED VIEW mv_video_comentarios;
-    REFRESH MATERIALIZED VIEW mv_canal_doacoes;
-END $$;
+    REFRESH MATERIALIZED VIEW vw_comentarios_video;
+    REFRESH MATERIALIZED VIEW vw_doacao_canal;
+END;
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- Conferências (cada par deve dar o mesmo valor)
+-- ---------------------------------------------------------------------
+-- SELECT SUM(qtd_total) FROM vw_comentarios_video;
+-- SELECT COUNT(*)       FROM Comentario;
+--
+-- SELECT SUM(soma_usd) FROM vw_doacao_canal;
+-- SELECT SUM(valor)    FROM Doacao WHERE status <> 'recusado';
+--
+-- SELECT SUM(total) FROM vw_receita_canal;
+-- SELECT (SELECT COALESCE(SUM(valor),0) FROM Patrocinio)
+--      + (SELECT COALESCE(SUM(soma_mensal_usd),0) FROM vw_membros_canal)
+--      + (SELECT COALESCE(SUM(soma_usd),0) FROM vw_doacao_canal);
 
 
 -- #####################################################################
--- PARTE 3 - CONSULTAS (functions parametrizadas)
--- Obs.: no PostgreSQL uma PROCEDURE não devolve conjunto de linhas; por
--- isso as consultas são FUNCTIONS RETURNS TABLE com parâmetro opcional
--- (DEFAULT NULL = sem filtro). Q2, Q3, Q4, Q7, Q10 e Q11 leem as
--- materializadas: rode CALL sp_atualizar_visoes() antes.
+-- PARTE 3 - CONSULTAS (12 functions parametrizadas)
 -- #####################################################################
 
--- Q1: streamers com mais vídeos publicados (vídeos dos canais que possuem)
---     e soma das visualizações. Filtro opcional: plataforma.
-CREATE OR REPLACE FUNCTION fn_q1_streamers_mais_videos(p_nro_plataforma integer DEFAULT NULL)
-RETURNS TABLE (nick_streamer varchar, qtd_videos bigint, soma_visualizacoes bigint)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+-- Convenções:
+--   * Streamer = dono do canal (Canal.nick_streamer). Convidados (Participa)
+--     não entram nas contagens.
+--   * Parâmetro de filtro: DEFAULT NULL = sem filtro.
+--   * Parâmetro k: nas consultas 8 a 11 o padrão é 10 e k nulo ou <= 0 dá
+--     erro; na 12, k nulo devolve todas as plataformas (k <= 0 dá erro).
+--   * Functions STABLE: só leem dados. Valores em USD; doação recusada não conta.
+--   * Colunas sempre com alias: os nomes do RETURNS TABLE viram variáveis em
+--     PL/pgSQL e causariam "column reference is ambiguous". Por isso o
+--     ORDER BY usa posição ou coluna qualificada.
+--   * Q2, Q3, Q4, Q7, Q10 e Q11 leem materializadas: CALL sp_atualizar_visoes().
+
+-- ---------------------------------------------------------------------
+-- Q1: streamers com mais vídeos publicados (quantidade e soma de visualizações)
+-- Filtro opcional: plataforma (Plataforma.nro)
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q01_streamers_mais_videos(
+    p_plataforma INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    nick_streamer   VARCHAR,
+    qtd_videos      BIGINT,
+    soma_visu_total BIGINT
+) AS $$
 BEGIN
     RETURN QUERY
     SELECT c.nick_streamer,
-           SUM(c.qtd_videos)::bigint,
-           SUM(c.qtd_visualizacoes)::bigint
-      FROM canal c
-     WHERE p_nro_plataforma IS NULL OR c.nro_plataforma = p_nro_plataforma
+           COUNT(v.id_video),
+           SUM(v.visu_total)
+      FROM Canal c
+      JOIN Video v ON v.id_canal = c.id_canal
+     WHERE p_plataforma IS NULL OR c.nro_plataforma = p_plataforma
      GROUP BY c.nick_streamer
      ORDER BY 2 DESC, 3 DESC, 1;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q2: vídeos com mais comentários (online, offline, total).
---     Filtro opcional: canal.
-CREATE OR REPLACE FUNCTION fn_q2_videos_mais_comentados(p_id_canal integer DEFAULT NULL)
-RETURNS TABLE (id_video integer, titulo varchar, canal_nome varchar,
-               qtd_online bigint, qtd_offline bigint, qtd_total bigint)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q2: vídeos com mais comentários (online, offline e total)
+-- Filtro opcional: canal (Canal.id_canal). Lê da V1.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q02_videos_mais_comentados(
+    p_canal INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    id_video    INTEGER,
+    titulo      VARCHAR,
+    id_canal    INTEGER,
+    canal_nome  VARCHAR,
+    qtd_online  BIGINT,
+    qtd_offline BIGINT,
+    qtd_total   BIGINT
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT v.id_video, v.titulo, c.nome,
+    SELECT m.id_video, m.titulo, m.id_canal, c.nome,
            m.qtd_online, m.qtd_offline, m.qtd_total
-      FROM mv_video_comentarios m
-      JOIN video v ON v.id_video = m.id_video
-      JOIN canal c ON c.id_canal = m.id_canal
-     WHERE p_id_canal IS NULL OR m.id_canal = p_id_canal
-     ORDER BY m.qtd_total DESC, v.id_video;
-END $$;
+      FROM vw_comentarios_video m
+      JOIN Canal c ON c.id_canal = m.id_canal
+     WHERE p_canal IS NULL OR m.id_canal = p_canal
+     ORDER BY m.qtd_total DESC, m.id_video;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
+
+-- ---------------------------------------------------------------------
 -- Q3: canais por total de interações (comentários online + offline) e
---     média por vídeo. Filtro opcional: streamer (dono).
-CREATE OR REPLACE FUNCTION fn_q3_canais_interacoes(p_nick_streamer varchar DEFAULT NULL)
-RETURNS TABLE (id_canal integer, canal_nome varchar, plataforma_nome varchar,
-               qtd_videos bigint, total_interacoes bigint, media_interacoes_por_video numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+-- média por vídeo. Filtro opcional: streamer (nick do dono). Lê da V1.
+-- LEFT JOIN: canal sem vídeo aparece com 0 (e média 0).
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q03_canais_mais_interacoes(
+    p_streamer VARCHAR DEFAULT NULL
+)
+RETURNS TABLE (
+    id_canal         INTEGER,
+    nome             VARCHAR,
+    nick_streamer    VARCHAR,
+    plataforma_nome  VARCHAR,
+    qtd_videos       BIGINT,
+    total_interacoes BIGINT,
+    media_por_video  NUMERIC
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT c.id_canal, c.nome, p.nome,
+    SELECT c.id_canal,
+           c.nome,
+           c.nick_streamer,
+           pl.nome,
            COUNT(m.id_video),
-           COALESCE(SUM(m.qtd_total), 0)::bigint,
-           COALESCE(ROUND(SUM(m.qtd_total)::numeric / NULLIF(COUNT(m.id_video), 0), 2), 0)
-      FROM canal c
-      JOIN plataforma p ON p.nro_plataforma = c.nro_plataforma
-      LEFT JOIN mv_video_comentarios m ON m.id_canal = c.id_canal
-     WHERE p_nick_streamer IS NULL OR c.nick_streamer = p_nick_streamer
-     GROUP BY c.id_canal, c.nome, p.nome
-     ORDER BY 5 DESC, 1;
-END $$;
+           COALESCE(SUM(m.qtd_total), 0)::BIGINT,
+           COALESCE(ROUND(SUM(m.qtd_total)::NUMERIC
+                          / NULLIF(COUNT(m.id_video), 0), 2), 0)
+      FROM Canal c
+      JOIN Plataforma pl ON pl.nro = c.nro_plataforma
+      LEFT JOIN vw_comentarios_video m ON m.id_canal = c.id_canal
+     WHERE p_streamer IS NULL OR c.nick_streamer = p_streamer
+     GROUP BY c.id_canal, c.nome, c.nick_streamer, pl.nome
+     ORDER BY 6 DESC, 1;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q4: canais pelo valor médio (USD) das doações por comentário que recebeu
---     doação, com quantidade de doações e valor total.
---     Filtro opcional: plataforma.
-CREATE OR REPLACE FUNCTION fn_q4_canais_media_doacao(p_nro_plataforma integer DEFAULT NULL)
-RETURNS TABLE (id_canal integer, canal_nome varchar, qtd_doacoes bigint,
-               valor_total_usd numeric, valor_medio_por_comentario_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q4: canais pelo valor médio das doações (por comentário = por doação,
+-- pois cada comentário tem no máximo uma doação). Mostra também a
+-- quantidade e o total. Filtro opcional: plataforma. Lê da V2.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q04_canais_media_doacao(
+    p_plataforma INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    id_canal       INTEGER,
+    nome           VARCHAR,
+    nro_plataforma INTEGER,
+    media_usd      NUMERIC,
+    qtd_doacoes    BIGINT,
+    soma_usd       NUMERIC
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT c.id_canal, c.nome, d.qtd_doacoes, d.valor_total_usd,
-           ROUND(d.valor_total_usd / d.qtd_comentarios_com_doacao, 4)
-      FROM mv_canal_doacoes d
-      JOIN canal c ON c.id_canal = d.id_canal
-     WHERE p_nro_plataforma IS NULL OR c.nro_plataforma = p_nro_plataforma
-     ORDER BY 5 DESC, 1;
-END $$;
+    SELECT d.id_canal, c.nome, d.nro_plataforma,
+           d.media_usd, d.qtd_doacoes, d.soma_usd
+      FROM vw_doacao_canal d
+      JOIN Canal c ON c.id_canal = d.id_canal
+     WHERE p_plataforma IS NULL OR d.nro_plataforma = p_plataforma
+     ORDER BY d.media_usd DESC, d.id_canal;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q5: canais patrocinados e valores pagos, por empresa.
---     Filtro opcional: empresa.
-CREATE OR REPLACE FUNCTION fn_q5_patrocinios_por_empresa(p_id_empresa integer DEFAULT NULL)
-RETURNS TABLE (id_empresa integer, empresa_nome varchar, id_canal integer, canal_nome varchar,
-               plataforma_nome varchar, valor_patrocinio_usd numeric, total_pago_empresa_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q5: canais patrocinados e valor pago por empresa.
+-- Filtro opcional: empresa (Empresa.nro). Lê direto de Patrocinio.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q05_patrocinios_por_empresa(
+    p_empresa INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    nro_empresa  INTEGER,
+    nome_empresa VARCHAR,
+    id_canal     INTEGER,
+    nome_canal   VARCHAR,
+    plataforma_nome        VARCHAR,
+    valor_usd              NUMERIC,
+    total_pago_empresa_usd NUMERIC
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT e.id_empresa, e.nome, c.id_canal, c.nome, pl.nome,
-           pt.valor,
-           SUM(pt.valor) OVER (PARTITION BY pt.id_empresa)
-      FROM patrocinio pt
-      JOIN empresa    e  ON e.id_empresa     = pt.id_empresa
-      JOIN canal      c  ON c.id_canal       = pt.id_canal
-      JOIN plataforma pl ON pl.nro_plataforma = c.nro_plataforma
-     WHERE p_id_empresa IS NULL OR pt.id_empresa = p_id_empresa
+    SELECT e.nro, e.nome, c.id_canal, c.nome, pl.nome, p.valor,
+           SUM(p.valor) OVER (PARTITION BY p.nro_empresa)
+      FROM Patrocinio p
+      JOIN Empresa    e  ON e.nro      = p.nro_empresa
+      JOIN Canal      c  ON c.id_canal = p.id_canal
+      JOIN Plataforma pl ON pl.nro     = c.nro_plataforma
+     WHERE p_empresa IS NULL OR p.nro_empresa = p_empresa
      ORDER BY 7 DESC, 1, 6 DESC, 3;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q6: de quantos canais cada usuário é membro e quanto desembolsa por mês.
---     Filtro opcional: usuário.
-CREATE OR REPLACE FUNCTION fn_q6_membros_por_usuario(p_nick_usuario varchar DEFAULT NULL)
-RETURNS TABLE (nick_membro varchar, qtd_canais bigint, valor_mensal_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q6: de quantos canais cada usuário é membro e quanto paga por mês.
+-- Filtro opcional: usuário (nick). Lê direto de Inscricao + NivelCanal.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q06_membros_por_usuario(
+    p_usuario VARCHAR DEFAULT NULL
+)
+RETURNS TABLE (
+    nick_usuario      VARCHAR,
+    qtd_canais        BIGINT,
+    valor_mensal_usd  NUMERIC
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT i.nick_membro, COUNT(*), SUM(n.valor)
-      FROM inscricao i
-      JOIN nivel_canal n ON n.id_canal = i.id_canal AND n.nivel = i.nivel
-     WHERE p_nick_usuario IS NULL OR i.nick_membro = p_nick_usuario
+    SELECT i.nick_membro,
+           COUNT(*),
+           SUM(n.valor)
+      FROM Inscricao i
+      JOIN NivelCanal n ON n.id_canal = i.id_canal
+                       AND n.nivel    = i.nivel
+     WHERE p_usuario IS NULL OR i.nick_membro = p_usuario
      GROUP BY i.nick_membro
      ORDER BY 3 DESC, 1;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q7: canais que já receberam doações e a soma recebida (USD).
---     Filtro opcional: canal.
-CREATE OR REPLACE FUNCTION fn_q7_canais_com_doacoes(p_id_canal integer DEFAULT NULL)
-RETURNS TABLE (id_canal integer, canal_nome varchar, qtd_doacoes bigint, valor_total_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q7: canais que já receberam doações e a soma recebida.
+-- Filtro opcional: canal (id_canal). Lê da V2.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q07_canais_com_doacoes(
+    p_canal INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    id_canal INTEGER,
+    nome     VARCHAR,
+    soma_usd NUMERIC
+) AS $$
 BEGIN
     RETURN QUERY
-    SELECT c.id_canal, c.nome, d.qtd_doacoes, d.valor_total_usd
-      FROM mv_canal_doacoes d
-      JOIN canal c ON c.id_canal = d.id_canal
-     WHERE p_id_canal IS NULL OR d.id_canal = p_id_canal
-     ORDER BY 4 DESC, 1;
-END $$;
+    SELECT d.id_canal, c.nome, d.soma_usd
+      FROM vw_doacao_canal d
+      JOIN Canal c ON c.id_canal = d.id_canal
+     WHERE p_canal IS NULL OR d.id_canal = p_canal
+     ORDER BY d.soma_usd DESC, d.id_canal;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q8: top-k canais que mais recebem patrocínio.
-CREATE OR REPLACE FUNCTION fn_q8_top_k_patrocinio(p_k integer DEFAULT 10)
-RETURNS TABLE (id_canal integer, canal_nome varchar, qtd_patrocinios bigint, valor_total_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q8: top-k canais que mais recebem patrocínio. Lê da V3.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q08_top_canais_patrocinio(
+    p_k INTEGER DEFAULT 10
+)
+RETURNS TABLE (
+    id_canal           INTEGER,
+    nome               VARCHAR,
+    qtd_patrocinadores BIGINT,
+    soma_patrocinio    NUMERIC
+) AS $$
 BEGIN
     IF p_k IS NULL OR p_k <= 0 THEN
         RAISE EXCEPTION 'Q8: k deve ser um inteiro positivo';
     END IF;
     RETURN QUERY
-    SELECT c.id_canal, c.nome, v.qtd_patrocinios, v.valor_total_usd
-      FROM vw_canal_patrocinio v
-      JOIN canal c ON c.id_canal = v.id_canal
-     ORDER BY 4 DESC, 1
+    SELECT p.id_canal, c.nome, p.qtd_patrocinadores, p.soma_patrocinio
+      FROM vw_patrocinio_canal p
+      JOIN Canal c ON c.id_canal = p.id_canal
+     ORDER BY p.soma_patrocinio DESC, p.id_canal
      LIMIT p_k;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
+
+-- ---------------------------------------------------------------------
 -- Q9: top-k canais que mais recebem aportes de membros (valor mensal).
-CREATE OR REPLACE FUNCTION fn_q9_top_k_membros(p_k integer DEFAULT 10)
-RETURNS TABLE (id_canal integer, canal_nome varchar, qtd_membros bigint, valor_mensal_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+-- Lê da V4.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q09_top_canais_membros(
+    p_k INTEGER DEFAULT 10
+)
+RETURNS TABLE (
+    id_canal        INTEGER,
+    nome            VARCHAR,
+    qtd_membros     BIGINT,
+    soma_mensal_usd NUMERIC
+) AS $$
 BEGIN
     IF p_k IS NULL OR p_k <= 0 THEN
         RAISE EXCEPTION 'Q9: k deve ser um inteiro positivo';
     END IF;
     RETURN QUERY
-    SELECT c.id_canal, c.nome, v.qtd_membros, v.valor_mensal_usd
-      FROM vw_canal_membros v
-      JOIN canal c ON c.id_canal = v.id_canal
-     ORDER BY 4 DESC, 1
+    SELECT m.id_canal, c.nome, m.qtd_membros, m.soma_mensal_usd
+      FROM vw_membros_canal m
+      JOIN Canal c ON c.id_canal = m.id_canal
+     ORDER BY m.soma_mensal_usd DESC, m.id_canal
      LIMIT p_k;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
+
+-- ---------------------------------------------------------------------
 -- Q10: top-k canais que mais receberam doações (todos os vídeos).
-CREATE OR REPLACE FUNCTION fn_q10_top_k_doacoes(p_k integer DEFAULT 10)
-RETURNS TABLE (id_canal integer, canal_nome varchar, qtd_doacoes bigint, valor_total_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+-- Lê da V2.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q10_top_canais_doacoes(
+    p_k INTEGER DEFAULT 10
+)
+RETURNS TABLE (
+    id_canal    INTEGER,
+    nome        VARCHAR,
+    qtd_doacoes BIGINT,
+    soma_usd    NUMERIC
+) AS $$
 BEGIN
     IF p_k IS NULL OR p_k <= 0 THEN
         RAISE EXCEPTION 'Q10: k deve ser um inteiro positivo';
     END IF;
     RETURN QUERY
-    SELECT c.id_canal, c.nome, d.qtd_doacoes, d.valor_total_usd
-      FROM mv_canal_doacoes d
-      JOIN canal c ON c.id_canal = d.id_canal
-     ORDER BY 4 DESC, 1
+    SELECT d.id_canal, c.nome, d.qtd_doacoes, d.soma_usd
+      FROM vw_doacao_canal d
+      JOIN Canal c ON c.id_canal = d.id_canal
+     ORDER BY d.soma_usd DESC, d.id_canal
      LIMIT p_k;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
+
+-- ---------------------------------------------------------------------
 -- Q11: top-k canais que mais faturam (patrocínio + membros + doações).
-CREATE OR REPLACE FUNCTION fn_q11_top_k_faturamento(p_k integer DEFAULT 10)
-RETURNS TABLE (id_canal integer, canal_nome varchar, patrocinio_usd numeric, membros_usd numeric,
-               doacoes_usd numeric, faturamento_total_usd numeric)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+-- Lê da V5. O aporte de membros entra como valor mensal (premissa).
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q11_top_canais_faturamento(
+    p_k INTEGER DEFAULT 10
+)
+RETURNS TABLE (
+    id_canal   INTEGER,
+    nome       VARCHAR,
+    patrocinio NUMERIC,
+    membros    NUMERIC,
+    doacoes    NUMERIC,
+    total      NUMERIC
+) AS $$
 BEGIN
     IF p_k IS NULL OR p_k <= 0 THEN
         RAISE EXCEPTION 'Q11: k deve ser um inteiro positivo';
     END IF;
     RETURN QUERY
-    SELECT c.id_canal, c.nome, f.patrocinio_usd, f.membros_usd, f.doacoes_usd, f.faturamento_total_usd
-      FROM vw_canal_faturamento f
-      JOIN canal c ON c.id_canal = f.id_canal
-     ORDER BY 6 DESC, 1
+    SELECT r.id_canal, r.nome, r.patrocinio, r.membros, r.doacoes, r.total
+      FROM vw_receita_canal r
+     ORDER BY r.total DESC, r.id_canal
      LIMIT p_k;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Q12 (desafio): top-k plataformas pela quantidade de streamers E de canais
---     (streamers = donos distintos de canais da plataforma; empate no
---     número de streamers é desfeito pelo número de canais).
---     Filtro opcional: plataforma.
-CREATE OR REPLACE FUNCTION fn_q12_top_k_plataformas(p_k integer DEFAULT NULL,
-                                                    p_nro_plataforma integer DEFAULT NULL)
-RETURNS TABLE (nro_plataforma integer, plataforma_nome varchar, qtd_streamers bigint, qtd_canais bigint)
-LANGUAGE plpgsql STABLE AS $$
-#variable_conflict use_column
+
+-- ---------------------------------------------------------------------
+-- Q12 (desafio): top-k plataformas por quantidade de streamers e canais.
+-- Filtro opcional: plataforma. Streamer = dono de canal na plataforma.
+-- Ordena por streamers e, no empate, por canais.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_q12_top_plataformas(
+    p_k          INTEGER DEFAULT NULL,
+    p_plataforma INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+    nro_plataforma INTEGER,
+    nome           VARCHAR,
+    qtd_streamers  BIGINT,
+    qtd_canais     BIGINT
+) AS $$
 BEGIN
     IF p_k IS NOT NULL AND p_k <= 0 THEN
         RAISE EXCEPTION 'Q12: k deve ser um inteiro positivo';
     END IF;
     RETURN QUERY
-    SELECT p.nro_plataforma, p.nome,
+    SELECT pl.nro,
+           pl.nome,
            COUNT(DISTINCT c.nick_streamer),
            COUNT(c.id_canal)
-      FROM plataforma p
-      LEFT JOIN canal c ON c.nro_plataforma = p.nro_plataforma
-     WHERE p_nro_plataforma IS NULL OR p.nro_plataforma = p_nro_plataforma
-     GROUP BY p.nro_plataforma, p.nome
+      FROM Plataforma pl
+      LEFT JOIN Canal c ON c.nro_plataforma = pl.nro
+     WHERE p_plataforma IS NULL OR pl.nro = p_plataforma
+     GROUP BY pl.nro, pl.nome
      ORDER BY 3 DESC, 4 DESC, 1
      LIMIT p_k;
-END $$;
+END;
+$$ LANGUAGE plpgsql STABLE;
