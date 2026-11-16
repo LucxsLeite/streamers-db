@@ -1,249 +1,255 @@
--- =====================================================================
--- PROJETO DE BANCO DE DADOS 2026/2 - UFF - Prof. Marcos Bedo
--- Arquivo 3: carga de dados artificiais
---
--- * Tudo roda em UMA transação: as regras "verificadas no COMMIT"
---   (T9a, T9b, T12, T15) só podem ser conferidas no fim.
--- * Os triggers ficam LIGADOS durante a carga e preenchem sozinhos:
---   plataforma.qtd_users (T1), canal.qtd_videos/qtd_visualizacoes (T2),
---   nivel_canal (T3), comentario.seq (T7), doacao.seq_pg (T8),
---   doacao.moeda/valor_usd (T16) e mecanismo_plat.seq_plataforma (T8b).
--- * Volumes (todos entre 1.000 e 10.000 linhas):
---   conversao 1000 | pais 1000 | empresa 2000 | empresa_pais 2500
---   plataforma 1000 | usuario 10000 | plataforma_usuario 10000
---   streamer_pais 1300 | canal 2000 | patrocinio 1900
---   nivel_canal 10000 (T3) | inscricao 10000 | video 10000
---   participa ~10000 | comentario 10000 | doacao 8000
---   bitcoin/paypal/cartao_credito/mecanismo_plat ~2000 cada
--- =====================================================================
-
-SELECT setseed(0.42);   -- dados reproduzíveis
-
 BEGIN;
 
--- ---------- moedas e países (códigos de moeda artificiais de 3 letras) ----------
-INSERT INTO conversao (moeda, nome, fator_conver)
-SELECT chr(65 + (i / 676) % 26) || chr(65 + (i / 26) % 26) || chr(65 + i % 26),
-       'Moeda ' || (i + 1),
-       ROUND((0.01 + random() * 4.99)::numeric, 6)
-  FROM generate_series(0, 999) AS i;
+-- ============================================================
+-- 1. Tabelas de base (domínio pequeno, declarado no relatório)
+-- ============================================================
+INSERT INTO Conversao (moeda, nome, fator_conver) VALUES
+    ('BRL', 'Real', 0.19), ('USD', 'Dólar', 1.00), ('EUR', 'Euro', 1.08),
+    ('GBP', 'Libra', 1.27), ('JPY', 'Iene', 0.0067), ('MXN', 'Peso mexicano', 0.055);
 
-INSERT INTO pais (ddi, nome, moeda)
-SELECT i + 1,
-       'Pais ' || (i + 1),
-       chr(65 + (i / 676) % 26) || chr(65 + (i / 26) % 26) || chr(65 + i % 26)
-  FROM generate_series(0, 999) AS i;
+INSERT INTO Pais (ddi, nome, moeda) VALUES
+    (55, 'Brasil', 'BRL'), (1, 'Estados Unidos', 'USD'), (351, 'Portugal', 'EUR'),
+    (44, 'Reino Unido', 'GBP'), (81, 'Japão', 'JPY'), (52, 'México', 'MXN'),
+    (49, 'Alemanha', 'EUR'), (33, 'França', 'EUR');
 
--- ---------- empresas (T9b: cada uma com ao menos um país, na mesma transação) ----------
-INSERT INTO empresa (id_empresa, nome, nome_fantasia)
-SELECT e, 'Empresa ' || e, 'Fantasia ' || e
-  FROM generate_series(1, 2000) AS e;
+INSERT INTO Empresa (nro, nome, nome_fantasia)
+SELECT k, 'Empresa ' || k, 'EF' || k FROM generate_series(1, 1000) k;
 
-INSERT INTO empresa_pais (id_empresa, ddi, id_nacional)
-SELECT e, (e % 1000) + 1, 'CN' || lpad(e::text, 8, '0')
-  FROM generate_series(1, 2000) AS e
-UNION ALL
-SELECT e, ((e + 500) % 1000) + 1, 'CN2' || lpad(e::text, 8, '0')
-  FROM generate_series(1, 500) AS e;
+INSERT INTO Plataforma (nro, nome, data_fund, empresa_fund, empresa_respo) VALUES
+    (1, 'YouTube', '2005-02-14', 1, 2),
+    (2, 'Twitch',  '2011-06-06', 3, 4),
+    (3, 'Kick',    '2022-12-01', 5, 6);
 
--- ---------- plataformas (qtd_users nasce 0 e é mantido por T1) ----------
-INSERT INTO plataforma (nro_plataforma, nome, empresa_fund, empresa_respo, data_fund)
-SELECT p,
-       'Plataforma ' || p,
-       1 + ((p * 7) % 2000),
-       1 + ((p * 11) % 2000),
-       DATE '2000-01-01' + floor(random() * 8000)::int
-  FROM generate_series(1, 1000) AS p;
+INSERT INTO EmpresaPais (nro_empresa, ddi_pais, id_nacional)
+SELECT k, (ARRAY[55,1,351,44,81,52,49,33])[1 + floor(random()*8)::int], 'NAC' || lpad(k::text, 6, '0')
+  FROM generate_series(1, 1000) k;
 
--- ---------- usuários e contas nas plataformas ----------
-INSERT INTO usuario (nick, email, data_nasc, telefone, end_postal, pais_residencia)
-SELECT 'user_' || i,
-       'user_' || i || '@exemplo.com',
-       DATE '1960-01-01' + floor(random() * 14000)::int,
-       '+55119' || lpad(i::text, 8, '0'),
-       'Rua ' || i || ', Cidade ' || (i % 500),
-       1 + floor(random() * 1000)::int
-  FROM generate_series(1, 10000) AS i;
+-- ============================================================
+-- 2. Usuários (5.000) e plataformas
+-- ============================================================
+INSERT INTO Usuario (nick, email, data_nasc, telefone, end_postal, pais_residencia)
+SELECT nick,
+       nick || '@mail.com',
+       DATE '1960-01-01' + floor(random()*16000)::int,
+       '+55 21 9' || lpad(k::text, 8, '0'),
+       'Rua ' || k || ', ' || k,
+       (ARRAY[55,1,351,44,81,52,49,33])[1 + floor(random()*8)::int]
+FROM (
+    SELECT k, (ARRAY['gamer','ana','lucas','bia','pedro','mari','joao','leo','zeca','kaka'])[1 + mod(k,10)]
+              || '_' || k AS nick
+      FROM generate_series(1, 5000) k
+) x;
 
-INSERT INTO plataforma_usuario (nro_plataforma, nick_usuario, nro_usuario)
-SELECT 1 + floor(1000 * power(random(), 2))::int,      -- plataformas de id baixo são mais populares
-       'user_' || i,
-       100000 + i
-  FROM generate_series(1, 10000) AS i;
+CREATE TEMP TABLE u_idx AS
+SELECT (row_number() OVER (ORDER BY nick))::int AS i, nick FROM Usuario;
 
--- ---------- streamers: user_1..user_1000, com 1 passaporte (300 com 2) ----------
-INSERT INTO streamer_pais (nick_streamer, ddi_pais, nro_passaporte)
-SELECT 'user_' || i, (i % 1000) + 1, 'P1' || lpad(i::text, 8, '0')
-  FROM generate_series(1, 1000) AS i
-UNION ALL
-SELECT 'user_' || i, ((i + 333) % 1000) + 1, 'P2' || lpad(i::text, 8, '0')
-  FROM generate_series(1, 300) AS i;
+INSERT INTO PlataformaUsuario (nro_plataforma, nick_usuario, nro_usuario)
+SELECT 1 + mod(i,3), nick, i FROM u_idx;
 
--- ---------- canais (T3 cria os 5 níveis; T15 exige 1 canal por streamer) ----------
--- canais 1..1000: um para cada streamer; 1001..2000: dono sorteado entre os streamers
-INSERT INTO canal (id_canal, nome, nro_plataforma, nick_streamer, tipo, data_inicio, descricao)
-WITH b AS (
-    SELECT g,
-           1 + floor(1000 * power(random(), 2))::int                              AS plat,
-           CASE WHEN g <= 1000 THEN g
-                ELSE 1 + floor(1000 * power(random(), 2))::int END                AS dono,
-           1 + floor(random() * 3)::int                                           AS t,
-           DATE '2015-01-01' + floor(random() * 2900)::int                        AS ini
-      FROM generate_series(1, 2000) AS g
+-- ============================================================
+-- 3. Streamers (300) com passaporte
+-- ============================================================
+CREATE TEMP TABLE st AS
+SELECT i, nick FROM u_idx WHERE i <= 300;
+
+INSERT INTO StreamerPais (nick_streamer, ddi_pais, nro_passaporte)
+SELECT s.nick, (ARRAY[55,1,351,44,81,52,49,33])[1 + mod(s.i,8)],
+       'PASS' || lpad(s.i::text, 6, '0')
+  FROM st s;
+
+INSERT INTO StreamerPais (nick_streamer, ddi_pais, nro_passaporte)
+SELECT s.nick, (ARRAY[55,1,351,44,81,52,49,33])[1 + mod(s.i + 3, 8)],
+       'PASS2' || lpad(s.i::text, 6, '0')
+  FROM st s WHERE mod(s.i,5) = 0
+ON CONFLICT DO NOTHING;
+
+-- ============================================================
+-- 4. Canais (1.000). Dono sempre é streamer com passaporte.
+-- ============================================================
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, descricao, nick_streamer)
+SELECT (ARRAY['GamerTV','Pro Arena','Bia Canta','Lucas Games','Pixel Lab','Terra Jogos'])[1 + mod(k,6)]
+       || ' ' || k,
+       1 + mod(k,3),
+       CASE WHEN random() < 0.8 THEN 'público' WHEN random() < 0.5 THEN 'misto' ELSE 'privado' END,
+       DATE '2019-01-01' + floor(random()*2500)::int,
+       'Canal de ' || (ARRAY['games','música','culinária','tecnologia'])[1 + mod(k,4)],
+       s.nick
+  FROM generate_series(1, 1000) k
+  JOIN st s ON s.i = 1 + mod(k, 300);
+
+-- 5 níveis por canal (trigger T05 confere no COMMIT)
+INSERT INTO NivelCanal (id_canal, nivel, valor, gif)
+SELECT c.id_canal, n.nivel,
+       round((n.valor * (0.8 + random()*0.4))::numeric, 2),
+       'nivel_' || c.id_canal || '_' || lower(n.nivel) || '.gif'
+  FROM Canal c
+ CROSS JOIN (VALUES ('Bronze', 3), ('Prata', 5), ('Ouro', 10), ('Diamante', 20), ('Lenda', 50))
+       AS n(nivel, valor);
+
+-- patrocínios: poucos canais recebem muitos (cauda longa)
+INSERT INTO Patrocinio (nro_empresa, id_canal, valor)
+SELECT (1 + floor(random()*1000))::int, c.id_canal,
+       round((100 + power(random(),2)*5000)::numeric, 2)
+  FROM Canal c
+ CROSS JOIN LATERAL generate_series(1, floor(power(random(),2)*5)::int) g
+ON CONFLICT DO NOTHING;
+
+-- membros: canais grandes têm mais membros.
+-- Exclui o dono do canal (trigger T09) e usa o nível do canal.
+WITH gen AS MATERIALIZED (
+    SELECT c.id_canal,
+           (1 + floor(random()*5000))::int AS ui,
+           (1 + floor(random()*5))::int AS ni
+      FROM Canal c
+     CROSS JOIN LATERAL generate_series(1, floor(power(random(),2)*8)::int) g
 )
-SELECT g,
-       'canal_' || g,
-       plat,
-       'user_' || dono,
-       (ARRAY['privado', 'publico', 'misto'])[t],
-       ini,
-       'Canal de jogos número ' || g
-  FROM b;
+INSERT INTO Inscricao (id_canal, nick_membro, nivel)
+SELECT g.id_canal, u.nick,
+       (ARRAY['Bronze','Prata','Ouro','Diamante','Lenda'])[g.ni]
+  FROM gen g
+  JOIN u_idx u ON u.i = g.ui
+  JOIN Canal c ON c.id_canal = g.id_canal
+ WHERE u.nick <> c.nick_streamer
+ON CONFLICT DO NOTHING;
 
--- ---------- patrocínios vigentes (1900 canais, 1 empresa cada) ----------
-INSERT INTO patrocinio (id_empresa, id_canal, valor)
-SELECT 1 + floor(random() * 2000)::int,
-       c,
-       ROUND((100 + random() * 49900)::numeric, 2)
-  FROM generate_series(1, 1900) AS c;
+-- ============================================================
+-- 5. Vídeos (cauda longa). Data sempre >= início do canal (T07).
+-- ============================================================
+CREATE TEMP TABLE pesos AS
+SELECT id_canal, nome, data_inicio, power(random(), 3) AS p FROM Canal;
 
--- ---------- membros vigentes: usuários 1001..5000 (nunca donos), 2 ou 3 canais cada ----------
-INSERT INTO inscricao (nick_membro, id_canal, nivel)
-SELECT 'user_' || u,
-       ((u * 13 + k * 667) % 2000) + 1,
-       1 + ((u + k) % 5)
-  FROM (SELECT 1000 + ((i - 1) % 4000) + 1 AS u,
-               (i - 1) / 4000              AS k
-          FROM generate_series(1, 10000) AS i) AS t;
+INSERT INTO Video (id_canal, titulo, dataH, tema, duracao, visu_simul, visu_total)
+SELECT g.id_canal,
+       'Episódio ' || g.k || ' - ' || g.nome,
+       g.data_v,
+       (ARRAY['RPG','Speedrun','Just Chatting','FPS','Estratégia','Terror'])[1 + floor(random()*6)::int],
+       (5 + floor(random()*240))::int * INTERVAL '1 minute',
+       floor(g.vt * (0.01 + random()*0.15))::int,
+       g.vt
+  FROM (
+      SELECT p.id_canal, p.nome, k,
+             p.data_inicio::timestamp
+                 + floor(random()*1000)::int * INTERVAL '1 day'
+                 + floor(random()*24)::int * INTERVAL '1 hour' AS data_v,
+             floor(power(random(),2) * 400000 * (0.1 + p.p))::int AS vt
+        FROM pesos p
+       CROSS JOIN LATERAL generate_series(1, 1 + floor(p.p*25)::int) k
+  ) g;
 
--- ---------- vídeos (T4: sempre depois do início do canal; T2 atualiza o canal) ----------
-INSERT INTO video (id_video, id_canal, titulo, data_hora, tema, duracao, visu_simul, visu_total)
-WITH b AS (
-    SELECT g,
-           1 + floor(2000 * power(random(), 2))::int       AS cid,
-           (100 + floor(random() * 500000))::int            AS vt,
-           1 + floor(random() * 6)::int                     AS t,
-           1 + floor(random() * 1200)::int                  AS dias,
-           floor(random() * 86400)::int                     AS seg,
-           10 + floor(random() * 230)::int                  AS minutos,
-           (0.01 + random() * 0.2)                          AS fr
-      FROM generate_series(1, 10000) AS g
+-- ============================================================
+-- 6. Comentários (seq de 1..N por vídeo, após a postagem: T10)
+-- ============================================================
+WITH gen AS MATERIALIZED (
+    SELECT v.id_video, v.dataH AS data_v, k,
+           (1 + floor(random()*5000))::int AS ui,
+           random() AS r
+      FROM Video v
+     CROSS JOIN LATERAL generate_series(1, floor(power(random(),2)*5)::int) k
 )
-SELECT b.g,
-       b.cid,
-       'Video ' || b.g,
-       c.data_inicio::timestamp + b.dias * INTERVAL '1 day' + b.seg * INTERVAL '1 second',
-       (ARRAY['FPS', 'RPG', 'Estratégia', 'Corrida', 'Esportes', 'Aventura'])[b.t],
-       make_interval(mins => b.minutos),
-       (b.vt * b.fr)::int,
-       b.vt
-  FROM b
-  JOIN canal c ON c.id_canal = b.cid;
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT g.id_video, g.k, u.nick,
+       (ARRAY['Boa!','Que lenda','Começou!','Kkkkk','Melhor episódio',
+              'Não acredito','Manda outro','Muito bom'])[1 + floor(g.r*8)::int],
+       g.data_v + g.k * INTERVAL '2 minutes' + floor(g.r*3600) * INTERVAL '1 second',
+       g.r < 0.6
+  FROM gen g
+  JOIN u_idx u ON u.i = g.ui;
 
--- ---------- convidados: 2 por vídeo nos vídeos 1..5000 (nunca o dono: T5) ----------
-INSERT INTO participa (id_video, nick_streamer)
-SELECT g.v, 'user_' || g.s
-  FROM (SELECT v, 1 + ((v * 17) % 1000) AS s FROM generate_series(1, 5000) AS v
-        UNION ALL
-        SELECT v, 1 + ((v * 29 + 5) % 1000) AS s FROM generate_series(1, 5000) AS v) AS g
-  JOIN video vi ON vi.id_video = g.v
-  JOIN canal c  ON c.id_canal  = vi.id_canal
- WHERE c.nick_streamer <> 'user_' || g.s;
-
--- ---------- comentários (seq por T7; data >= postagem do vídeo) ----------
-INSERT INTO comentario (id_video, nick_usuario, texto, data_hora, coment_on)
-WITH b AS (
-    SELECT j,
-           1 + floor(10000 * power(random(), 2))::int AS vid,
-           1 + floor(random() * 10000)::int           AS u,
-           (random() < 0.7)                           AS online,
-           floor(random() * 300)::int                 AS horas,
-           floor(random() * 3600)::int                AS seg
-      FROM generate_series(1, 10000) AS j
+-- participação de streamers convidados (~15% dos vídeos).
+-- Exclui o dono do canal do vídeo (trigger T08).
+WITH v AS MATERIALIZED (
+    SELECT vid.id_video, vid.id_canal, (1 + floor(random()*300))::int AS si
+      FROM Video vid WHERE random() < 0.15
 )
-SELECT b.vid,
-       'user_' || b.u,
-       'Comentário ' || b.j,
-       v.data_hora + b.horas * INTERVAL '1 hour' + b.seg * INTERVAL '1 second',
-       b.online
-  FROM b
-  JOIN video v ON v.id_video = b.vid
- ORDER BY b.j;
+INSERT INTO Participa (id_video, nick_streamer)
+SELECT v.id_video, s.nick
+  FROM v
+  JOIN st s ON s.i = v.si
+  JOIN Canal c ON c.id_canal = v.id_canal
+ WHERE s.nick <> c.nick_streamer
+ON CONFLICT DO NOTHING;
 
--- ---------- doações: 8000 (valor_original em moeda local; T8 numera, T16 converte p/ USD) ----------
-INSERT INTO doacao (id_video, seq_comentario, valor_original, status)
-SELECT t.id_video,
-       t.seq,
-       ROUND((1 + random() * 499)::numeric, 2),
-       CASE WHEN random() < 0.10  THEN 'recusado'
-            WHEN random() < 0.667 THEN 'recebido'
-            ELSE 'lido' END
-  FROM (SELECT id_video, seq, ROW_NUMBER() OVER (ORDER BY id_video, seq) AS rn
-          FROM comentario) AS t
- CROSS JOIN LATERAL generate_series(1, CASE WHEN t.rn % 5 = 0 THEN 2
-                                            WHEN t.rn % 2 = 0 THEN 1
-                                            ELSE 0 END) AS n
- ORDER BY t.rn, n;
+-- ============================================================
+-- 7. Doações (~50% dos comentários). Trigger T06 converte para USD.
+-- ============================================================
+WITH cand AS MATERIALIZED (
+    SELECT c.id_comentario, c.nick_usuario
+      FROM Comentario c
+     WHERE random() < 0.5
+)
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, p.moeda,
+       round((5 + power(random(),2)*300)::numeric, 2),
+       CASE WHEN random() < 0.7 THEN 'recebido'
+            WHEN random() < 0.5 THEN 'lido'
+            ELSE 'recusado' END
+  FROM cand c
+  JOIN Usuario u ON u.nick = c.nick_usuario
+  JOIN Pais p    ON p.ddi = u.pais_residencia;
 
--- ---------- formas de pagamento (T13/T9a: exatamente uma por doação) ----------
-INSERT INTO bitcoin (id_video, seq_comentario, seq_pg, txid)
-SELECT id_video, seq_comentario, seq_pg,
-       md5('btc-' || id_video || '-' || seq_comentario || '-' || seq_pg)
-    || md5('BTC-' || seq_pg || '-' || seq_comentario || '-' || id_video)
-  FROM doacao
- WHERE (id_video + seq_comentario + seq_pg) % 4 = 0;
+CREATE TEMP TABLE tmp_meio AS
+SELECT id_comentario, (id_comentario % 4) AS m FROM Doacao;
 
-INSERT INTO paypal (id_video, seq_comentario, seq_pg, id_paypal)
-SELECT id_video, seq_comentario, seq_pg,
-       'PP-' || upper(md5('pp-' || id_video || '-' || seq_comentario || '-' || seq_pg))
-  FROM doacao
- WHERE (id_video + seq_comentario + seq_pg) % 4 = 1;
+INSERT INTO Cartao (nro, bandeira)
+SELECT 'CARD' || lpad(k::text, 6, '0'),
+       (ARRAY['Visa','Mastercard','Elo','Amex'])[1 + floor(random()*4)::int]
+  FROM generate_series(1, 1000) k;
 
-INSERT INTO cartao_credito (id_video, seq_comentario, seq_pg, nro_cartao, bandeira, data_hora)
-SELECT d.id_video, d.seq_comentario, d.seq_pg,
-       '4' || lpad((ROW_NUMBER() OVER (ORDER BY d.id_video, d.seq_comentario, d.seq_pg))::text, 15, '0'),
-       (ARRAY['Visa', 'Mastercard', 'Elo', 'American Express'])[1 + ((d.id_video + d.seq_pg) % 4)],
-       c.data_hora
-  FROM doacao d
-  JOIN comentario c ON c.id_video = d.id_video AND c.seq = d.seq_comentario
- WHERE (d.id_video + d.seq_comentario + d.seq_pg) % 4 = 2;
+INSERT INTO CartaoCredito (id_comentario, nro_cartao)
+SELECT id_comentario, 'CARD' || lpad((1 + mod(id_comentario, 1000))::text, 6, '0')
+  FROM tmp_meio WHERE m = 0;
 
-INSERT INTO mecanismo_plat (id_video, seq_comentario, seq_pg)
-SELECT id_video, seq_comentario, seq_pg
-  FROM doacao
- WHERE (id_video + seq_comentario + seq_pg) % 4 = 3
- ORDER BY id_video, seq_comentario, seq_pg;
+INSERT INTO BitCoin (id_comentario, TxID)
+SELECT id_comentario, 'tx' || md5(id_comentario::text || random()::text)
+  FROM tmp_meio WHERE m = 1;
 
-COMMIT;   -- aqui rodam T9a, T9b, T12 e T15
+INSERT INTO PayPal (id_comentario, IdPayPal)
+SELECT id_comentario, 'PP' || lpad(id_comentario::text, 8, '0')
+  FROM tmp_meio WHERE m = 2;
 
--- ---------- pós-carga ----------
--- Alinha as sequences dos identificadores artificiais com os ids carregados
-SELECT setval(pg_get_serial_sequence('empresa',    'id_empresa'),     (SELECT MAX(id_empresa)     FROM empresa));
-SELECT setval(pg_get_serial_sequence('plataforma', 'nro_plataforma'), (SELECT MAX(nro_plataforma) FROM plataforma));
-SELECT setval(pg_get_serial_sequence('canal',      'id_canal'),       (SELECT MAX(id_canal)       FROM canal));
-SELECT setval(pg_get_serial_sequence('video',      'id_video'),       (SELECT MAX(id_video)       FROM video));
+INSERT INTO MecanismoPlat (id_comentario, seq_plataforma)
+SELECT id_comentario, id_comentario * 7 + 1000
+  FROM tmp_meio WHERE m = 3;
 
-ANALYZE;
+-- ============================================================
+-- 8. Bloco de referência fixa (nomes conhecidos para os testes)
+-- ============================================================
+INSERT INTO Usuario (nick, email, data_nasc, telefone, end_postal, pais_residencia) VALUES
+    ('ana_fan',  'ana@ref.com',   '2000-01-01', '+55 21 900000001', 'Rua Ref A', 55),
+    ('pedro_gg', 'pedro@ref.com', '1999-01-01', '+55 21 900000002', 'Rua Ref B', 55);
+
+INSERT INTO StreamerPais (nick_streamer, ddi_pais, nro_passaporte)
+    VALUES ('ana_fan', 55, 'REF0001');
+
+INSERT INTO Canal (nome, nro_plataforma, tipo, data_inicio, nick_streamer)
+    VALUES ('GamerTV', 1, 'público', '2020-01-01', 'ana_fan');
+
+INSERT INTO NivelCanal (id_canal, nivel, valor, gif)
+SELECT c.id_canal, n.nivel, n.valor, 'ref_' || n.nivel || '.gif'
+  FROM Canal c
+ CROSS JOIN (VALUES ('Bronze', 3.00), ('Prata', 5.00), ('Ouro', 10.00),
+                    ('Diamante', 20.00), ('Lenda', 50.00)) AS n(nivel, valor)
+ WHERE c.nome = 'GamerTV';
+
+INSERT INTO Video (id_canal, titulo, dataH, tema, duracao, visu_simul, visu_total)
+SELECT id_canal, 'Zerando', '2026-03-10 19:00', 'RPG', INTERVAL '1 hour', 100, 500
+  FROM Canal WHERE nome = 'GamerTV';
+
+INSERT INTO Comentario (id_video, seq, nick_usuario, texto, dataH, coment_on)
+SELECT id_video, 1, 'pedro_gg', 'Boa', '2026-03-10 19:02', TRUE
+  FROM Video WHERE titulo = 'Zerando';
+
+INSERT INTO Doacao (id_comentario, moeda, valor_original, status)
+SELECT c.id_comentario, 'BRL', 100.00, 'recebido'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 1;
+ 
+INSERT INTO CartaoCredito (id_comentario, nro_cartao)
+SELECT c.id_comentario, 'CARD000001'
+  FROM Comentario c JOIN Video v ON v.id_video = c.id_video
+ WHERE v.titulo = 'Zerando' AND c.seq = 1;
+
+COMMIT;
+
+-- Atualiza as visões materializadas (criadas vazias no 02_plsql.sql)
 CALL sp_atualizar_visoes();
-
--- Conferência dos volumes
-SELECT 'conversao' AS tabela, COUNT(*) AS linhas FROM conversao
-UNION ALL SELECT 'pais',               COUNT(*) FROM pais
-UNION ALL SELECT 'empresa',            COUNT(*) FROM empresa
-UNION ALL SELECT 'empresa_pais',       COUNT(*) FROM empresa_pais
-UNION ALL SELECT 'plataforma',         COUNT(*) FROM plataforma
-UNION ALL SELECT 'usuario',            COUNT(*) FROM usuario
-UNION ALL SELECT 'plataforma_usuario', COUNT(*) FROM plataforma_usuario
-UNION ALL SELECT 'streamer_pais',      COUNT(*) FROM streamer_pais
-UNION ALL SELECT 'canal',              COUNT(*) FROM canal
-UNION ALL SELECT 'patrocinio',         COUNT(*) FROM patrocinio
-UNION ALL SELECT 'nivel_canal',        COUNT(*) FROM nivel_canal
-UNION ALL SELECT 'inscricao',          COUNT(*) FROM inscricao
-UNION ALL SELECT 'video',              COUNT(*) FROM video
-UNION ALL SELECT 'participa',          COUNT(*) FROM participa
-UNION ALL SELECT 'comentario',         COUNT(*) FROM comentario
-UNION ALL SELECT 'doacao',             COUNT(*) FROM doacao
-UNION ALL SELECT 'bitcoin',            COUNT(*) FROM bitcoin
-UNION ALL SELECT 'paypal',             COUNT(*) FROM paypal
-UNION ALL SELECT 'cartao_credito',     COUNT(*) FROM cartao_credito
-UNION ALL SELECT 'mecanismo_plat',     COUNT(*) FROM mecanismo_plat;
